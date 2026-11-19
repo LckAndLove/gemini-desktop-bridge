@@ -11,6 +11,17 @@ mkdir -p -m 700 "$support"
 icon="$project/assets/GeminiDesktopBridge.png"
 fingerprint="$(/usr/bin/shasum -a 256 "$project/bridge/GeminiDesktopBridge.swift" \
   "$project/bridge/Info.plist" "$icon" | /usr/bin/awk '{print $1}')"
+build=""
+cleanup() {
+  if [[ -n "$build" && -d "$build" ]]; then
+    if [[ ! -d "$app" && -d "$build/previous.app" ]]; then
+      mv "$build/previous.app" "$app" || true
+    fi
+    /usr/bin/python3 -c 'import sys, shutil; shutil.rmtree(sys.argv[1], ignore_errors=True)' "$build"
+  fi
+}
+trap cleanup EXIT
+
 if [[ ! -x "$app/Contents/MacOS/GeminiDesktopBridge" ]] ||
    [[ ! -f "$support/helper-source.sha256" ]] ||
    [[ "$(<"$support/helper-source.sha256")" != "$fingerprint" ]]; then
@@ -31,12 +42,7 @@ if [[ ! -x "$app/Contents/MacOS/GeminiDesktopBridge" ]] ||
   if [[ -d "$app" ]]; then
     mv "$app" "$build/previous.app"
   fi
-  if ! mv "$staged" "$app"; then
-    if [[ -d "$build/previous.app" ]]; then mv "$build/previous.app" "$app"; fi
-    exit 1
-  fi
-  # Remove only the private staging tree created by this invocation.
-  /usr/bin/python3 -c 'import sys, shutil; shutil.rmtree(sys.argv[1])' "$build"
+  mv "$staged" "$app"
   printf '%s\n' "$fingerprint" > "$support/helper-source.sha256"
 fi
 

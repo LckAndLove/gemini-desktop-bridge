@@ -45,7 +45,7 @@ agy mcp list
 
 `running` 时继续查询，`completed` 携带 `reply`。收到 `timed_out` 或 `submission_unknown` 时，仍按原 ID 查询。客户端或服务重启后状态可恢复。若返回 `conversation_not_found`，先在 Gemini 打开原会话，然后继续用同一 ID 查询。收到 `not_submitted` 时可查看 `code` 和 `detail`，处理后以新 ID 发起一次明确的重试。登录、系统授权及未知弹窗须在 Mac 上处理。桥接只确认预期目录的访问提示。
 
-额度工具返回 `five_hour` 与 `weekly`，两个对象各自报告状态、用量、剩余比例和界面显示的重置时间。顶层字段继续对应周额度，兼容原有调用。界面只显示已使用百分比时，剩余比例按 `100 - 已使用百分比` 计算，并用 `remaining_source` 标明来源。缺失值返回 `null`。查询使用 Gemini 原生设置页。Google 将「当前用量」对应的短周期说明为五小时。[Gemini 官方额度说明](https://support.google.com/gemini/answer/16275805)
+额度工具返回 `five_hour` 与 `weekly`，两个对象各自报告状态、用量、剩余比例和界面显示的重置时间。顶层字段继续对应周额度，兼容原有调用。界面只显示已使用百分比时，剩余比例按 `100 - 已使用百分比` 计算，并用 `remaining_source` 标明来源。缺失值返回 `null`。查询使用 Gemini 原生设置页。调用结束时会尝试关闭本次查询打开的设置窗口，已打开的设置窗口会保留。Google 将「当前用量」对应的短周期说明为五小时。[Gemini 官方额度说明](https://support.google.com/gemini/answer/16275805)
 
 指定模型时先调用 `gemini_list_models`，再将可用条目的完整 `label` 填为 `model`。提交前会在当前界面核对菜单确实已选中该项。省略模型时沿用 Gemini 当前选择。模型列表会随账户和模式变化。查询会切换到一个新的空白输入页，且不会发送消息。
 

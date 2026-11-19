@@ -30,6 +30,11 @@ func attr(_ item: AXUIElement, _ key: String) -> AnyObject? {
     return value
 }
 
+func asAXElement(_ value: AnyObject?) -> AXUIElement? {
+    guard let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+    return unsafeBitCast(value, to: AXUIElement.self)
+}
+
 func label(_ item: AXUIElement, _ key: String = "AXTitle") -> String {
     attr(item, key) as? String ?? ""
 }
@@ -45,11 +50,17 @@ func labels(_ item: AXUIElement) -> [String] {
     ["AXTitle", "AXDescription", "AXValue", "AXPlaceholderValue"].map { label(item, $0) }
 }
 
+func isMatchingButton(_ item: AXUIElement, _ names: [String]) -> Bool {
+    ["AXButton", "AXMenuItem", "AXRadioButton"].contains(label(item, "AXRole")) &&
+    !(Set(labels(item) + [label(item, "AXIdentifier")]).isDisjoint(with: names))
+}
+
 func button(_ items: [AXUIElement], _ names: [String]) -> AXUIElement? {
-    items.first { item in
-        ["AXButton", "AXMenuItem", "AXRadioButton"].contains(label(item, "AXRole")) &&
-        !(Set(labels(item) + [label(item, "AXIdentifier")]).isDisjoint(with: names))
-    }
+    items.first { isMatchingButton($0, names) }
+}
+
+func lastButton(_ items: [AXUIElement], _ names: [String]) -> AXUIElement? {
+    items.last { isMatchingButton($0, names) }
 }
 
 func sleepBriefly() {
@@ -111,7 +122,7 @@ final class Gemini {
     }
 
     private func window() -> AXUIElement? {
-        if let focused = attr(root, "AXFocusedWindow") { return (focused as! AXUIElement) }
+        if let focused = asAXElement(attr(root, "AXFocusedWindow")) { return focused }
         return (attr(root, "AXWindows") as? [AXUIElement])?.first
     }
 
@@ -212,6 +223,7 @@ final class Gemini {
         let pathField = try waitFor("path_input_missing", "The open panel did not show Go to Folder.", seconds: 4) {
             self.items().first { label($0, "AXRole") == "AXSheet" }
         }
+        try key(0, flags: .maskCommand)
         try paste(path)
         guard nodes(pathField).contains(where: { label($0, "AXValue") == path }) else {
             throw BridgeError("path_verification_failed", "The native directory picker did not accept the exact requested path.")
@@ -336,22 +348,49 @@ final class Gemini {
 
     func usageQuota() throws -> [String: Any] {
         let titles = ["用量限额", "Usage limits", "Usage Limits"]
-        func settingsWindow() -> AXUIElement? {
-            (attr(root, "AXWindows") as? [AXUIElement])?.first {
-                nodes($0, skipSidebar: false).contains {
-                    label($0, "AXIdentifier") == "settings_search_field"
+        func windows() -> [AXUIElement]? {
+            attr(root, "AXWindows") as? [AXUIElement]
+        }
+        func isSettings(_ window: AXUIElement) -> Bool {
+            nodes(window, skipSidebar: false).contains {
+                label($0, "AXIdentifier") == "settings_search_field"
+            }
+        }
+        guard let originalWindows = windows() else {
+            throw BridgeError("quota_settings_unavailable", "Could not inspect Gemini's windows before opening settings.")
+        }
+        let existing = originalWindows.first(where: isSettings)
+        func openedSettings() -> AXUIElement? {
+            windows()?.first { candidate in
+                !originalWindows.contains { CFEqual($0, candidate) } && isSettings(candidate)
+            }
+        }
+        var openingRequested = false
+        var ownedWindow: AXUIElement?
+        defer {
+            if openingRequested {
+                // Cleanup can run after the operation deadline. Only use the
+                // native close control of the exact window opened by this call.
+                if let target = ownedWindow ?? openedSettings(),
+                   windows()?.contains(where: { CFEqual($0, target) }) == true,
+                   let close = asAXElement(attr(target, "AXCloseButton")) {
+                    let status = AXUIElementPerformAction(close, "AXPress" as CFString)
+                    if status != .success {
+                        NSLog("Gemini Desktop Bridge could not close its settings window (AX %d).", status.rawValue)
+                    }
                 }
             }
         }
-        let existing = settingsWindow()
-        if existing == nil { try key(43, flags: .maskCommand) }
-        let settings = try waitFor("quota_settings_unavailable", "Gemini's settings window did not open.", seconds: 5) {
-            settingsWindow()
-        }
-        defer {
-            if existing == nil, let close = attr(settings, "AXCloseButton") {
-                try? press(close as! AXUIElement)
+        let settings: AXUIElement
+        if let existing {
+            settings = existing
+        } else {
+            try key(43, flags: .maskCommand)
+            openingRequested = true
+            settings = try waitFor("quota_settings_unavailable", "Gemini's settings window did not open.", seconds: 5) {
+                openedSettings()
             }
+            ownedWindow = settings
         }
         let row = try waitFor("quota_page_unavailable", "Gemini Settings has no visible Usage limits page.", seconds: 4) {
             nodes(settings, skipSidebar: false).first {
@@ -483,7 +522,7 @@ final class Gemini {
         let failed = button(toolbar, ["失败", "任务失败", "Failed", "Canceled", "Cancelled", "已取消"])
         let complete = button(toolbar, ["已完成", "Completed", "Done"])
         let stop = button(items, ["stop_button"])
-        let copy = button(items, ["copy-button"])
+        let copy = lastButton(items, ["copy-button"])
         var result: [String: Any] = ["status": "running", "window_title": label(main)]
         if failed != nil {
             result["status"] = "task_failed"
@@ -513,12 +552,11 @@ final class Gemini {
         var ancestor = copy
         var axText: String?
         for _ in 0..<9 {
-            guard let parent = attr(ancestor, "AXParent") else { break }
-            ancestor = parent as! AXUIElement
+            guard let parent = asAXElement(attr(ancestor, "AXParent")) else { break }
+            ancestor = parent
             let fragments = nodes(ancestor).filter { label($0, "AXRole") == "AXStaticText" }.compactMap { item in
                 labels(item).first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
             }
-            if fragments.count == 1 { return fragments[0] }
             if !fragments.isEmpty {
                 axText = fragments.joined(separator: "\n")
                 break

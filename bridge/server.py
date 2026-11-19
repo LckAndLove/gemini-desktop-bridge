@@ -17,6 +17,7 @@ import time
 SUPPORT = Path.home() / "Library/Application Support/Gemini Desktop Bridge"
 HELPER = Path.home() / "Applications/Gemini Desktop Bridge.app"
 TERMINAL = {"completed", "task_failed", "not_submitted", "released"}
+OBSERVED = {"running", "completed", "task_failed", "conversation_not_found", "result_unavailable", "attention_required"}
 TASK_ID = re.compile(r"[A-Za-z0-9_-]{1,80}\Z")
 PROTOCOLS = {"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"}
 
@@ -112,6 +113,7 @@ def invoke(action, budget, **request):
 
 
 def invoke_with_foreground_recovery(action, budget, **request):
+    started = time.monotonic()
     result = invoke(action, budget, **request)
     if result.get("status") != "gemini_not_frontmost" or result.get("may_have_submitted") is not False:
         return result
@@ -125,7 +127,8 @@ def invoke_with_foreground_recovery(action, budget, **request):
     except (OSError, subprocess.TimeoutExpired):
         return result
     if opened.returncode == 0:
-        return invoke(action, budget, **request)
+        remaining = max(1.0, budget - (time.monotonic() - started))
+        return invoke(action, remaining, **request)
     return result
 
 
@@ -180,8 +183,13 @@ def validate(tool, args):
 
 
 def submit(db, mode, args, existing):
-    directory = args.get("directory")
-    identity = [mode, args["message"], directory, args.get("timeout_seconds", 300)]
+    raw_directory = args.get("directory")
+    normalized_directory = None
+    if raw_directory is not None:
+        if not Path(raw_directory).is_absolute():
+            raise ValueError("directory must be an absolute path")
+        normalized_directory = str(Path(raw_directory).resolve(strict=False))
+    identity = [mode, args["message"], normalized_directory, args.get("timeout_seconds", 300)]
     model = args.get("model")
     if model is not None:
         identity.append(model)
@@ -190,10 +198,9 @@ def submit(db, mode, args, existing):
         if existing["fingerprint"] != fingerprint:
             raise ValueError("This task_id already identifies a different request")
         return expose(existing)
-    if directory is not None:
-        if not Path(directory).is_absolute():
-            raise ValueError("directory must be an absolute path")
-        directory = str(Path(directory).resolve(strict=True))
+    directory = None
+    if normalized_directory is not None:
+        directory = str(Path(raw_directory).resolve(strict=True))
         if not Path(directory).is_dir() or directory == "/":
             raise ValueError("directory must identify a local folder other than the root")
     active = db.execute("SELECT id FROM task WHERE active=1").fetchone()
@@ -228,12 +235,30 @@ def get_result(db, item):
         return expose(item)
     observed = invoke("query", 20, mode=item["mode"], marker=item["marker"], windowTitle=item.get("window_title"))
     observed.pop("may_have_submitted", None)
+    status = observed.get("status")
+    expired = time.time() >= item["expires_at"]
+    if status not in OBSERVED:
+        if expired:
+            item.pop("phase", None)
+            item.update(
+                status="timed_out",
+                code=status,
+                detail=observed.get("detail") or "The task exceeded its polling deadline. It may still be running. You can keep querying the same task ID.",
+            )
+            save(db, item)
+            return expose(item)
+        # Report transient helper/UI diagnostic errors without overwriting the persisted task state.
+        response = expose(item)
+        response["code"] = status
+        if "detail" in observed:
+            response["detail"] = observed["detail"]
+        return response
     item.pop("detail", None)
     item.pop("phase", None)
     item.pop("code", None)
-    if item["status"] == "submission_unknown" and observed["status"] == "conversation_not_found":
+    if item["status"] == "submission_unknown" and status == "conversation_not_found":
         observed["status"] = "submission_unknown"
-    if time.time() >= item["expires_at"] and observed["status"] not in TERMINAL:
+    if expired and observed["status"] not in TERMINAL:
         observed.update(code=observed["status"], status="timed_out")
         observed.setdefault("detail", "The task exceeded its polling deadline. It may still be running. You can keep querying the same task ID.")
     item.update(observed)
@@ -269,7 +294,7 @@ def call(name, args):
         if name == "gemini_get_result":
             return get_result(db, item)
         if not args["confirmed"] or item["status"] not in {
-            "timed_out", "submission_unknown", "conversation_not_found", "result_unavailable"
+            "timed_out", "submission_unknown", "conversation_not_found", "result_unavailable", "attention_required"
         }:
             raise ValueError("Release requires user confirmation and an uncertain or timed-out task")
         item.update(status="released", detail="Tracking released at the user's request.")
@@ -279,7 +304,10 @@ def call(name, args):
 
 def dispatch(msg):
     method = msg.get("method")
-    params = msg.get("params", {})
+    raw_params = msg.get("params")
+    if raw_params is not None and not isinstance(raw_params, dict):
+        return None, {"code": -32602, "message": "Invalid params"}
+    params = raw_params or {}
     if method == "initialize":
         version = params.get("protocolVersion")
         return {
@@ -312,6 +340,8 @@ def send(response):
 def run():
     os.umask(0o077)
     for line in sys.stdin:
+        if not line.strip():
+            continue
         try:
             msg = json.loads(line)
         except (ValueError, UnicodeError):
