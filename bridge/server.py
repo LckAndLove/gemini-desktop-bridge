@@ -64,7 +64,7 @@ TOOLS = [
     },
     {
         "name": "gemini_get_weekly_quota",
-        "description": "Read the signed-in Gemini Desktop account’s weekly usage settings. Returns remaining percentage and the reset text if visible. Does not send a message.",
+        "description": "Read the signed-in Gemini Desktop account’s five-hour and weekly quota. Returns usage, remaining percentage, and reset text where available. Existing top-level fields describe the weekly quota.",
         "inputSchema": schema({}),
     },
     {

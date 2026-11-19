@@ -334,7 +334,7 @@ final class Gemini {
         }
     }
 
-    func weeklyQuota() throws -> [String: Any] {
+    func usageQuota() throws -> [String: Any] {
         let titles = ["用量限额", "Usage limits", "Usage Limits"]
         func settingsWindow() -> AXUIElement? {
             (attr(root, "AXWindows") as? [AXUIElement])?.first {
@@ -364,6 +364,8 @@ final class Gemini {
             let selected = AXUIElementSetAttributeValue(row, "AXSelected" as CFString, kCFBooleanTrue)
             if selected != .success { try press(row) }
         }
+        // Google labels the five-hour card "Current usage" in this desktop UI.
+        let fiveHour = #"(?i)(?:五小时限额|5\s*小时限额|5[- ]hour (?:limit(?:s)?|usage)|five[- ]hour (?:limit(?:s)?|usage)|当前用量|current usage)\s*[:：]?\s*"#
         let weekly = #"(?i)(?:每周限额|weekly limit(?:s)?|weekly usage)\s*[:：]?\s*"#
         let used = #"(?i)(?:已使用\s*(\d{1,3})\s*%|(\d{1,3})\s*%\s*used|used\s*(\d{1,3})\s*%)"#
         let remaining = #"(?i)(?:剩余\s*(\d{1,3})\s*%|(\d{1,3})\s*%\s*(?:remaining|left))"#
@@ -373,33 +375,48 @@ final class Gemini {
                   let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) else { return [] }
             return (1..<match.numberOfRanges).compactMap { Range(match.range(at: $0), in: text).map { String(text[$0]) } }
         }
-        var section: String?
-        _ = try? waitFor("quota_fields_unavailable", "Gemini did not expose weekly usage values.", seconds: 7) {
+        let footer = #"(?i)使用 AI 点数|高级设置|AI (?:points|credits)|advanced settings|learn more"#
+
+        func quotaSection(_ text: String, heading: String) -> String? {
+            guard let start = text.range(of: heading, options: .regularExpression) else { return nil }
+            let rest = text[start.upperBound...]
+            let boundary = [fiveHour, weekly, footer].compactMap {
+                rest.range(of: $0, options: .regularExpression)?.lowerBound
+            }.min() ?? rest.endIndex
+            return rest[..<boundary].trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        func fields(_ section: String?) -> [String: Any] {
+            let text = section ?? ""
+            let usedPercent = groups(used, text).compactMap(Int.init).first { (0...100).contains($0) }
+            let shownRemaining = groups(remaining, text).compactMap(Int.init).first { (0...100).contains($0) }
+            let remainingPercent = shownRemaining ?? usedPercent.map { 100 - $0 }
+            let resetText = groups(reset, text).first?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return [
+                "status": remainingPercent != nil && resetText != nil ? "ready" : "quota_fields_unavailable",
+                "remaining_percent": remainingPercent as Any? ?? NSNull(),
+                "remaining_source": shownRemaining != nil ? "displayed" : (usedPercent != nil ? "100_minus_displayed_used_percent" : "unavailable"),
+                "used_percent": usedPercent as Any? ?? NSNull(),
+                "reset_display": resetText as Any? ?? NSNull()
+            ]
+        }
+
+        var short: [String: Any] = fields(nil)
+        var week: [String: Any] = fields(nil)
+        _ = try? waitFor("quota_fields_unavailable", "Gemini did not expose both usage periods.", seconds: 7) {
             var seen = Set<String>()
             let text = nodes(settings).filter {
                 ["AXStaticText", "AXGroup", "AXHeading", "AXProgressIndicator"].contains(label($0, "AXRole"))
             }.flatMap(labels).filter { !$0.isEmpty && seen.insert($0).inserted }.joined(separator: " ")
-            guard let start = text.range(of: weekly, options: .regularExpression) else { return nil as Bool? }
-            let rest = String(text[start.upperBound...])
-            let boundary = rest.range(of: #"(?i)使用 AI 点数|高级设置|AI (?:points|credits)|advanced settings|learn more"#,
-                                      options: .regularExpression)?.lowerBound ?? rest.endIndex
-            let visible = String(rest[..<boundary]).trimmingCharacters(in: .whitespacesAndNewlines)
-            section = visible
-            let hasPercent = !groups(used, visible).isEmpty || !groups(remaining, visible).isEmpty
-            return hasPercent && !groups(reset, visible).isEmpty ? true : nil
+            short = fields(quotaSection(text, heading: fiveHour))
+            week = fields(quotaSection(text, heading: weekly))
+            return (short["status"] as? String) == "ready" && (week["status"] as? String) == "ready" ? true : nil
         } as Bool
-        let text = section ?? ""
-        let usedPercent = groups(used, text).compactMap(Int.init).first { (0...100).contains($0) }
-        let shownRemaining = groups(remaining, text).compactMap(Int.init).first { (0...100).contains($0) }
-        let remainingPercent = shownRemaining ?? usedPercent.map { 100 - $0 }
-        let resetText = groups(reset, text).first?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return [
-            "status": remainingPercent != nil && resetText != nil ? "ready" : "quota_fields_unavailable",
-            "remaining_percent": remainingPercent as Any? ?? NSNull(),
-            "remaining_source": shownRemaining != nil ? "displayed" : (usedPercent != nil ? "100_minus_displayed_used_percent" : "unavailable"),
-            "used_percent": usedPercent as Any? ?? NSNull(),
-            "reset_display": resetText as Any? ?? NSNull()
-        ]
+        // Keep the original top-level fields, including status, scoped to weekly usage.
+        var result = week
+        result["five_hour"] = short
+        result["weekly"] = week
+        return result
     }
 
     func listModels() throws -> [String: Any] {
@@ -578,7 +595,7 @@ do {
         switch request.action {
         case "submit": result = try gemini.submit()
         case "models": result = try gemini.listModels()
-        case "quota": result = try gemini.weeklyQuota()
+        case "quota": result = try gemini.usageQuota()
         case "query": result = try gemini.query()
         default: throw BridgeError("invalid_request", "Unknown helper action.")
         }

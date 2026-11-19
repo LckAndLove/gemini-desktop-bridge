@@ -37,13 +37,15 @@ agy mcp list
 | `gemini_submit_chat` | `task_id`、`message`，可选 `timeout_seconds`、`model` | 以普通对话模式新建会话并发送一条消息。 |
 | `gemini_list_models` | `mode`（`chat` 或 `task`） | 空闲时实时打开该模式的模型菜单，返回当前选中、完整标签和可用状态。 |
 | `gemini_get_result` | `task_id` | 返回当前状态或完整回复。建议每隔 3–5 秒查询。 |
-| `gemini_get_weekly_quota` | 无 | 读取 Gemini 设置中的每周用量和重置时间。页面只显示已使用百分比时，剩余比例按 100 减去显示值计算。无法读取的字段返回空值。 |
+| `gemini_get_weekly_quota` | 无 | 读取 Gemini 设置中的五小时与每周用量、剩余比例及重置时间。 |
 | `gemini_health` | 无 | 检查本机辅助功能、键盘权限和辅助应用。 |
 | `gemini_release` | `task_id`、`confirmed: true` | 用户检查旧任务已结束后，解除超时或未确认任务的占用。旧任务 ID 仍会被记录。 |
 
 `task_id` 可使用 1 至 80 位 ASCII 字母、数字、连字符和下划线。为每个不同的动作使用新 ID。重复提交同一 ID 和相同参数只返回已有状态，参数不同会报错。一次只执行一个 Gemini 会话。常规任务默认超时 300 秒，可设为 30 到 3600 秒。
 
 `running` 时继续查询，`completed` 携带 `reply`。收到 `timed_out` 或 `submission_unknown` 时，仍按原 ID 查询。客户端或服务重启后状态可恢复。若返回 `conversation_not_found`，先在 Gemini 打开原会话，然后继续用同一 ID 查询。收到 `not_submitted` 时可查看 `code` 和 `detail`，处理后以新 ID 发起一次明确的重试。登录、系统授权及未知弹窗须在 Mac 上处理。桥接只确认预期目录的访问提示。
+
+额度工具返回 `five_hour` 与 `weekly`，两个对象各自报告状态、用量、剩余比例和界面显示的重置时间。顶层字段继续对应周额度，兼容原有调用。界面只显示已使用百分比时，剩余比例按 `100 - 已使用百分比` 计算，并用 `remaining_source` 标明来源。缺失值返回 `null`。查询使用 Gemini 原生设置页。Google 将「当前用量」对应的短周期说明为五小时。[Gemini 官方额度说明](https://support.google.com/gemini/answer/16275805)
 
 指定模型时先调用 `gemini_list_models`，再将可用条目的完整 `label` 填为 `model`。提交前会在当前界面核对菜单确实已选中该项。省略模型时沿用 Gemini 当前选择。模型列表会随账户和模式变化。查询会切换到一个新的空白输入页，且不会发送消息。
 
