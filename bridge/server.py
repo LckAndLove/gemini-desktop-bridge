@@ -86,6 +86,7 @@ TOOLS = [
 def invoke(action, budget, **request):
     if not HELPER.is_dir():
         return {"status": "helper_missing", "detail": f"Install the helper at {HELPER}.", "may_have_submitted": False}
+    SUPPORT.mkdir(mode=0o700, parents=True, exist_ok=True)
     deadline = time.time() + budget
     with tempfile.TemporaryDirectory(prefix="call-", dir=SUPPORT) as tmp:
         folder = Path(tmp)
@@ -275,11 +276,11 @@ def call(name, args):
     if not tool:
         raise ValueError("Unknown tool")
     validate(tool, args)
+    if name == "gemini_health":
+        result = invoke("health", 5)
+        result.pop("may_have_submitted", None)
+        return result
     with journal() as db:
-        if name == "gemini_health":
-            result = invoke("health", 5)
-            result.pop("may_have_submitted", None)
-            return result
         if name in {"gemini_list_models", "gemini_get_weekly_quota"}:
             active = db.execute("SELECT id FROM task WHERE active=1").fetchone()
             if active:
@@ -325,7 +326,8 @@ def dispatch(msg):
         return {}, None
     if method == "tools/call":
         try:
-            result = call(params.get("name"), params.get("arguments", {}))
+            args = params.get("arguments")
+            result = call(params.get("name"), {} if args is None else args)
             is_error = False
         except (ValueError, RuntimeError, OSError, sqlite3.Error) as error:
             result = {"status": "bridge_error", "detail": str(error)}

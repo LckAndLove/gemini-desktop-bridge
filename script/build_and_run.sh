@@ -6,6 +6,7 @@ support="$HOME/Library/Application Support/Gemini Desktop Bridge"
 app="$HOME/Applications/Gemini Desktop Bridge.app"
 mkdir -p "$HOME/Applications"
 mkdir -p -m 700 "$support"
+chmod 700 "$support"
 
 # Avoid changing the ad hoc signature on reinstall when the helper source is unchanged.
 icon="$project/assets/GeminiDesktopBridge.png"

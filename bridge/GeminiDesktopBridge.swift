@@ -39,11 +39,17 @@ func label(_ item: AXUIElement, _ key: String = "AXTitle") -> String {
     attr(item, key) as? String ?? ""
 }
 
-func nodes(_ item: AXUIElement, skipSidebar: Bool = true, depth: Int = 0) -> [AXUIElement] {
-    guard depth < 28 else { return [] }
-    if skipSidebar && label(item, "AXRole") == "AXOutline" { return [] }
-    let children = attr(item, "AXChildren") as? [AXUIElement] ?? []
-    return [item] + children.flatMap { nodes($0, skipSidebar: skipSidebar, depth: depth + 1) }
+func nodes(_ item: AXUIElement, skipSidebar: Bool = true) -> [AXUIElement] {
+    var result: [AXUIElement] = []
+    func visit(_ element: AXUIElement, depth: Int) {
+        guard depth < 28, !skipSidebar || label(element, "AXRole") != "AXOutline" else { return }
+        result.append(element)
+        for child in attr(element, "AXChildren") as? [AXUIElement] ?? [] {
+            visit(child, depth: depth + 1)
+        }
+    }
+    visit(item, depth: 0)
+    return result
 }
 
 func labels(_ item: AXUIElement) -> [String] {
@@ -57,10 +63,6 @@ func isMatchingButton(_ item: AXUIElement, _ names: [String]) -> Bool {
 
 func button(_ items: [AXUIElement], _ names: [String]) -> AXUIElement? {
     items.first { isMatchingButton($0, names) }
-}
-
-func lastButton(_ items: [AXUIElement], _ names: [String]) -> AXUIElement? {
-    items.last { isMatchingButton($0, names) }
 }
 
 func sleepBriefly() {
@@ -223,7 +225,7 @@ final class Gemini {
         let name = URL(fileURLWithPath: path).lastPathComponent
         try press(matchingButton(["文件夹", "Folders", "Folder"]), allowTimeout: true)
         try press(matchingButton(["添加新文件夹…", "添加新文件夹", "Add new folder…", "Add new folder...", "Add New Folder…"]))
-        _ = try waitFor("picker_missing", "Gemini did not open the directory picker.", seconds: 5) {
+        let panel = try waitFor("picker_missing", "Gemini did not open the directory picker.", seconds: 5) {
             self.window().flatMap {
                 label($0, "AXIdentifier") == "open-panel" && button(nodes($0), ["OKButton"]) != nil ? $0 : nil
             }
@@ -239,7 +241,9 @@ final class Gemini {
         }
         try key(36)
         let choose = try waitFor("directory_not_selected", "The open panel did not navigate to the requested directory.", seconds: 5) {
-            let items = self.items()
+            guard let current = self.window(), CFEqual(current, panel) else { return nil as AXUIElement? }
+            let items = nodes(current)
+            guard !items.contains(where: { label($0, "AXRole") == "AXSheet" }) else { return nil }
             let navigated = items.contains {
                 label($0, "AXIdentifier") == "where popup" && label($0, "AXValue") == name
             }
@@ -288,8 +292,12 @@ final class Gemini {
             throw BridgeError("gemini_dialog", "Close Gemini's separate dialog and bring its main window forward.")
         }
         let initial = nodes(main, skipSidebar: false)
+        let newChatNames = ["发起新对话", "New chat", "Start a new chat"]
         let newChat = button(initial, ["newChat_button"]) ??
-            button(initial.filter { label($0, "AXIdentifier").isEmpty }, ["发起新对话", "New chat", "Start a new chat"])
+            button(initial.filter { label($0, "AXIdentifier").isEmpty }, newChatNames) ??
+            asAXElement(attr(root, "AXMenuBar")).flatMap { menuBar in
+                button(nodes(menuBar, skipSidebar: false), newChatNames)
+            }
         guard let newChat else {
             if button(initial, ["登录", "Sign in", "Sign In", "登录 Google 账号"]) != nil {
                 throw BridgeError("login_required", "Sign in to Gemini Desktop and retry with a new task ID.")
@@ -341,7 +349,12 @@ final class Gemini {
     }
 
     private func closeModelMenu(_ popover: AXUIElement) throws {
-        if AXUIElementPerformAction(popover, "AXCancel" as CFString) != .success { try key(53) }
+        if AXUIElementPerformAction(popover, "AXCancel" as CFString) != .success {
+            try activateGemini()
+            if nodes(popover).contains(where: { label($0, "AXRole") == "AXPopover" }) {
+                try key(53)
+            }
+        }
         _ = try waitFor("model_menu_still_open", "Gemini did not close its model picker.", seconds: 2) {
             guard let selector = button(self.items(), ["tab_stop_model_selector"]) else { return nil as Bool? }
             return nodes(selector).contains { label($0, "AXRole") == "AXPopover" } ? nil : true
@@ -428,7 +441,7 @@ final class Gemini {
         let weekly = #"(?i)(?:每周限额|weekly limit(?:s)?|weekly usage)\s*[:：]?\s*"#
         let used = #"(?i)(?:已使用\s*(\d{1,3})\s*%|(\d{1,3})\s*%\s*used|used\s*(\d{1,3})\s*%)"#
         let remaining = #"(?i)(?:剩余\s*(\d{1,3})\s*%|(\d{1,3})\s*%\s*(?:remaining|left))"#
-        let reset = #"(?i)(?:重置时间\s*[:：]?|resets?\s*(?:at|on|:)?|reset time\s*:?)\s*(.+)"#
+        let reset = #"(?i)(?:重置时间\s*[:：]?|reset time\s*:?|resets?\s*(?:at|on|:)?)[ \t]*([^\n%]{0,80}?\d{1,2}:\d{2}(?:[ \t]*[ap]\.?m\.?)?)"#
         func groups(_ pattern: String, _ text: String) -> [String] {
             guard let regex = try? NSRegularExpression(pattern: pattern),
                   let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) else { return [] }
@@ -521,6 +534,7 @@ final class Gemini {
                 throw BridgeError("composer_changed", "The Gemini composer changed before pasting.")
             }
             _ = AXUIElementSetAttributeValue(input, "AXFocused" as CFString, kCFBooleanTrue)
+            try key(0, flags: .maskCommand)
             try paste(prompt)
         }
         let send = try matchingButton(["send_button"])
@@ -542,15 +556,18 @@ final class Gemini {
     private func observation(marker: String) -> [String: Any]? {
         guard let main = mainWindow() else { return nil }
         let items = nodes(main)
-        let accepted = items.contains {
+        guard let promptIndex = items.firstIndex(where: {
             label($0, "AXRole") == "AXHeading" && labels($0).contains { $0.hasPrefix(marker) }
-        }
-        guard accepted else { return nil }
+        }) else { return nil }
         let toolbar = items.first { label($0, "AXRole") == "AXToolbar" }.map { nodes($0) } ?? []
         let failed = button(toolbar, ["失败", "任务失败", "Failed", "Canceled", "Cancelled", "已取消"])
         let complete = button(toolbar, ["已完成", "Completed", "Done"])
         let stop = button(items, ["stop_button"])
-        let copy = lastButton(items, ["copy-button"])
+        let promptRow = ancestorRow(items[promptIndex])
+        let copy = items.dropFirst(promptIndex + 1).last { item in
+            guard isMatchingButton(item, ["copy-button"]), let row = ancestorRow(item) else { return false }
+            return promptRow.map { !CFEqual($0, row) } ?? false
+        }
         var result: [String: Any] = ["status": "running", "window_title": label(main)]
         if failed != nil {
             result["status"] = "task_failed"
@@ -576,21 +593,31 @@ final class Gemini {
         return result
     }
 
-    private func replyText(_ copy: AXUIElement) -> String? {
-        var ancestor = copy
-        var axText: String?
-        for _ in 0..<9 {
-            guard let parent = asAXElement(attr(ancestor, "AXParent")) else { break }
-            ancestor = parent
-            let fragments = nodes(ancestor).filter { label($0, "AXRole") == "AXStaticText" }.compactMap { item in
-                labels(item).first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            }
-            if !fragments.isEmpty {
-                axText = fragments.joined(separator: "\n")
-                break
-            }
-            if label(ancestor, "AXRole") == "AXRow" { break }
+    private func ancestorRow(_ element: AXUIElement) -> AXUIElement? {
+        var current = element
+        for _ in 0..<12 {
+            if label(current, "AXRole") == "AXRow" { return current }
+            guard let parent = asAXElement(attr(current, "AXParent")) else { break }
+            current = parent
         }
+        return nil
+    }
+
+    private func replyText(_ copy: AXUIElement) -> String? {
+        var fragments: [String] = []
+        func collect(_ element: AXUIElement) {
+            let role = label(element, "AXRole")
+            guard !["AXButton", "AXMenuButton", "AXMenu", "AXToolbar"].contains(role) else { return }
+            if role == "AXStaticText", let content = labels(element).first(where: {
+                !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }) {
+                fragments.append(content)
+                return
+            }
+            for child in attr(element, "AXChildren") as? [AXUIElement] ?? [] { collect(child) }
+        }
+        if let row = ancestorRow(copy) { collect(row) }
+        let axText = fragments.isEmpty ? nil : fragments.joined(separator: "\n")
         guard app.isActive else { return axText }
         let board = NSPasteboard.general
         let original = preserveClipboard()
@@ -640,13 +667,16 @@ let requestURL = URL(fileURLWithPath: arguments[2])
 let responseURL = requestURL.deletingLastPathComponent().appendingPathComponent("response.json")
 let armedURL = requestURL.deletingLastPathComponent().appendingPathComponent("armed")
 let helperLockURL = requestURL.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("helper.lock")
-let lock = open(helperLockURL.path, O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR)
-defer { if lock >= 0 { close(lock) } }
 do {
-    guard lock >= 0, flock(lock, LOCK_EX | LOCK_NB) == 0 else {
-        throw BridgeError("helper_busy", "The previous desktop operation is still exiting. Query or retry after it exits.")
-    }
     let request = try JSONDecoder().decode(Request.self, from: Data(contentsOf: requestURL))
+    var lock: Int32 = -1
+    defer { if lock >= 0 { close(lock) } }
+    if request.action != "health" {
+        lock = open(helperLockURL.path, O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR)
+        guard lock >= 0, flock(lock, LOCK_EX | LOCK_NB) == 0 else {
+            throw BridgeError("helper_busy", "The previous desktop operation is still exiting. Query or retry after it exits.")
+        }
+    }
     guard AXIsProcessTrusted() else {
         throw BridgeError("accessibility_required", "Enable Gemini Desktop Bridge in System Settings → Privacy & Security → Accessibility.")
     }

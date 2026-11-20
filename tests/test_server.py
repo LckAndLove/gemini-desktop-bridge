@@ -33,6 +33,56 @@ class ServerTest(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(error["code"], -32602)
 
+    def test_null_health_arguments_and_lock_independence(self):
+        with mock.patch.object(server, "invoke", return_value={"status": "ready"}) as helper:
+            with server.journal():
+                result, error = server.dispatch({
+                    "method": "tools/call", "params": {"name": "gemini_health", "arguments": None}
+                })
+                self.assertIsNone(error)
+                self.assertFalse(result["isError"])
+                helper.assert_called_once_with("health", 5)
+        result, _ = server.dispatch({
+            "method": "tools/call", "params": {"name": "gemini_health", "arguments": []}
+        })
+        self.assertTrue(result["isError"])
+
+    def test_foreground_recovery_only_retries_known_pre_submit_failure(self):
+        for armed in (True, False, None):
+            with self.subTest(may_have_submitted=armed):
+                initial = {"status": "gemini_not_frontmost", "may_have_submitted": armed}
+                with mock.patch.object(server, "invoke", side_effect=[initial, {"status": "running"}]) as invoke, \
+                     mock.patch.object(server.subprocess, "run", return_value=mock.Mock(returncode=0)) as launch:
+                    result = server.invoke_with_foreground_recovery("submit", 10)
+                self.assertEqual(invoke.call_count, 2 if armed is False else 1)
+                self.assertEqual(launch.call_count, 1 if armed is False else 0)
+                self.assertEqual(result["status"], "running" if armed is False else initial["status"])
+
+    def test_validation_checks_message_and_timeout_boundaries(self):
+        tool = next(tool for tool in server.TOOLS if tool["name"] == "gemini_submit_chat")
+        good = {"task_id": "chat_1", "message": "a" * 16000, "timeout_seconds": 30}
+        server.validate(tool, good)
+        for bad in ({"timeout_seconds": True}, {"timeout_seconds": 29}, {"timeout_seconds": 3601},
+                    {"message": "a" * 16001}, {"message": "a\0b"}, {"task_id": "bad id"}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    server.validate(tool, good | bad)
+
+    def test_active_task_blocks_second_submission_and_release(self):
+        with mock.patch.object(server, "invoke_with_foreground_recovery", return_value={"status": "running"}) as helper:
+            server.call("gemini_submit_chat", {"task_id": "first", "message": "hi"})
+            result = server.call("gemini_submit_chat", {"task_id": "second", "message": "hi"})
+            self.assertEqual(result["status"], "busy")
+            self.assertEqual(result["active_task_id"], "first")
+            self.assertEqual(helper.call_count, 1)
+        for state in ("running", "completed"):
+            with self.subTest(state=state):
+                if state == "completed":
+                    with mock.patch.object(server, "invoke", return_value={"status": state, "reply": "ok"}):
+                        server.call("gemini_get_result", {"task_id": "first"})
+                with self.assertRaises(ValueError):
+                    server.call("gemini_release", {"task_id": "first", "confirmed": True})
+
     def test_submit_normalizes_directory_fingerprint(self):
         with mock.patch.object(server, "invoke_with_foreground_recovery", return_value={"status": "running"}) as mocked:
             first = server.call("gemini_submit_task", {
@@ -99,6 +149,11 @@ class ServerTest(unittest.TestCase):
             timed_out = server.call("gemini_get_result", {"task_id": "chat-3"})
         self.assertEqual(timed_out["status"], "timed_out")
         self.assertEqual(timed_out["code"], "helper_busy")
+
+        with mock.patch.object(server, "invoke", return_value={"status": "completed", "reply": "late"}):
+            result = server.call("gemini_get_result", {"task_id": "chat-3"})
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["reply"], "late")
 
 
 if __name__ == "__main__":
