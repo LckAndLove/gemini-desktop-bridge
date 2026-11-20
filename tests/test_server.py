@@ -255,6 +255,105 @@ server.run_helper(folder, Path(sys.argv[3]))
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["reply"], "late")
 
+    def test_continue_chat_forwards_parent_marker_and_window_title(self):
+        with mock.patch.object(
+            server,
+            "invoke_with_foreground_recovery",
+            return_value={"status": "running", "window_title": "Gemini - Topic"},
+        ):
+            server.call("gemini_submit_chat", {"task_id": "chat-a", "message": "first"})
+        with mock.patch.object(
+            server,
+            "invoke",
+            return_value={"status": "completed", "reply": "first reply", "window_title": "Gemini - Topic"},
+        ):
+            server.call("gemini_get_result", {"task_id": "chat-a"})
+
+        with mock.patch.object(
+            server,
+            "invoke_with_foreground_recovery",
+            return_value={"status": "running", "window_title": "Gemini - Topic"},
+        ) as mocked:
+            cont = server.call("gemini_submit_chat", {
+                "task_id": "chat-b",
+                "message": "follow up",
+                "continue_from_task_id": "chat-a",
+            })
+        self.assertEqual(cont["status"], "running")
+        self.assertEqual(cont["continue_from_task_id"], "chat-a")
+        _, kwargs = mocked.call_args
+        self.assertTrue(kwargs["continueMarker"].startswith("[Gemini Bridge "))
+        self.assertEqual(kwargs["windowTitle"], "Gemini - Topic")
+
+        # Retrying with the same task_id and continue_from_task_id is idempotent.
+        with mock.patch.object(server, "invoke_with_foreground_recovery") as retry_mock:
+            again = server.call("gemini_submit_chat", {
+                "task_id": "chat-b",
+                "message": "follow up",
+                "continue_from_task_id": "chat-a",
+            })
+        self.assertEqual(again["status"], "running")
+        self.assertEqual(retry_mock.call_count, 0)
+
+    def test_continue_task_inherits_directory_and_validates_constraints(self):
+        with mock.patch.object(
+            server,
+            "invoke_with_foreground_recovery",
+            return_value={"status": "running", "window_title": "Gemini - Repo Task"},
+        ):
+            server.call("gemini_submit_task", {
+                "task_id": "task-a",
+                "message": "inspect",
+                "directory": str(self.work_dir),
+            })
+        with mock.patch.object(
+            server,
+            "invoke",
+            return_value={"status": "completed", "reply": "done", "window_title": "Gemini - Repo Task"},
+        ):
+            server.call("gemini_get_result", {"task_id": "task-a"})
+
+        other_dir = Path(self.tmp.name) / "other"
+        other_dir.mkdir()
+        with self.assertRaises(ValueError):
+            server.call("gemini_submit_task", {
+                "task_id": "task-bad-dir",
+                "message": "follow up",
+                "directory": str(other_dir),
+                "continue_from_task_id": "task-a",
+            })
+        with self.assertRaises(ValueError):
+            server.call("gemini_submit_chat", {
+                "task_id": "chat-wrong-mode",
+                "message": "follow up",
+                "continue_from_task_id": "task-a",
+            })
+        with self.assertRaises(ValueError):
+            server.call("gemini_submit_task", {
+                "task_id": "task-no-dir",
+                "message": "fresh without dir",
+            })
+        with self.assertRaises(ValueError):
+            server.call("gemini_submit_chat", {
+                "task_id": "self-ref",
+                "message": "loop",
+                "continue_from_task_id": "self-ref",
+            })
+
+        with mock.patch.object(
+            server,
+            "invoke_with_foreground_recovery",
+            return_value={"status": "running", "window_title": "Gemini - Repo Task"},
+        ):
+            cont = server.call("gemini_submit_task", {
+                "task_id": "task-b",
+                "message": "follow up",
+                "continue_from_task_id": "task-a",
+            })
+        self.assertEqual(cont["status"], "running")
+        self.assertEqual(cont["directory"], str(self.work_dir.resolve()))
+        self.assertEqual(cont["continue_from_task_id"], "task-a")
+
 
 if __name__ == "__main__":
     unittest.main()

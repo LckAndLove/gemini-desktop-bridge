@@ -10,6 +10,7 @@ struct Request: Decodable {
     let directory: String?
     let message: String?
     let marker: String?
+    let continueMarker: String?
     let windowTitle: String?
     let deadline: TimeInterval
 }
@@ -126,8 +127,8 @@ final class Gemini {
     init(_ request: Request, armedURL: URL) throws {
         self.request = request
         self.armedURL = armedURL
-        let backgroundChat = request.action == "submit" && request.mode == "chat"
-        let needsForeground = request.action != "query" && !backgroundChat
+        let backgroundSubmit = request.action == "submit" && (request.mode == "chat" || request.continueMarker != nil)
+        let needsForeground = request.action != "query" && !backgroundSubmit
         if NSRunningApplication.runningApplications(withBundleIdentifier: geminiID).isEmpty {
             try openGemini(inBackground: !needsForeground)
         }
@@ -260,9 +261,16 @@ final class Gemini {
         let names = request.mode == "chat"
             ? ["问问 Gemini", "Ask Gemini"]
             : ["分配任务", "描述任务", "Assign a task", "Describe a task"]
-        return items.first {
+        if let matched = items.first(where: {
             label($0, "AXRole") == "AXTextArea" && !Set(labels($0)).isDisjoint(with: names)
+        }) {
+            return matched
         }
+        guard request.continueMarker != nil else { return nil }
+        let textAreas = items.filter {
+            label($0, "AXRole") == "AXTextArea" && (attr($0, "AXEnabled") as? Bool) != false
+        }
+        return textAreas.count == 1 ? textAreas[0] : nil
     }
 
     private func folderNames(for path: String) -> [String] {
@@ -305,8 +313,9 @@ final class Gemini {
         ownedPanel = panel
         try key(5, flags: [.maskCommand, .maskShift])
         let pathField = try waitFor("path_input_missing", "The open panel did not show Go to Folder.", seconds: 4) {
-            guard let current = self.window(), CFEqual(current, panel) else { return nil as AXUIElement? }
-            return nodes(panel).first { label($0, "AXRole") == "AXSheet" }
+            nodes(panel).first {
+                label($0, "AXRole") == "AXSheet" && label($0, "AXIdentifier") == "GoToWindow"
+            }
         }
         try key(0, flags: .maskCommand)
         try paste(path)
@@ -349,11 +358,18 @@ final class Gemini {
         // AX cleanup is scoped to this picker and can run after the request deadline.
         let deadline = Date().addingTimeInterval(1)
         if let sheet = nodes(panel).first(where: { label($0, "AXRole") == "AXSheet" }) {
-            if AXUIElementPerformAction(sheet, "AXCancel" as CFString) != .success {
-                if let cancel = button(nodes(sheet), ["CancelButton", "取消", "Cancel"]) {
-                    _ = AXUIElementPerformAction(cancel, "AXPress" as CFString)
-                } else if app.isActive, CGPreflightPostEventAccess(),
-                          let focused = window(), CFEqual(focused, panel) || CFEqual(focused, sheet) {
+            if let cancel = button(nodes(sheet), ["CloseButton", "CancelButton", "关闭", "取消", "Cancel"]) {
+                _ = AXUIElementPerformAction(cancel, "AXPress" as CFString)
+            } else {
+                _ = AXUIElementPerformAction(sheet, "AXCancel" as CFString)
+            }
+            sleepBriefly()
+            if nodes(panel).contains(where: { CFEqual($0, sheet) }),
+               app.isActive, CGPreflightPostEventAccess() {
+                _ = AXUIElementPerformAction(panel, "AXRaise" as CFString)
+                sleepBriefly()
+                if app.isActive, let focused = asAXElement(attr(root, "AXFocusedUIElement")),
+                   nodes(sheet).contains(where: { CFEqual($0, focused) }) {
                     for down in [true, false] {
                         CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: down)?
                             .post(tap: .cghidEventTap)
@@ -378,7 +394,7 @@ final class Gemini {
         }
     }
 
-    private func prepareComposer() throws {
+    private func focusMainWindow() throws -> AXUIElement {
         try checkForSheet(items())
         guard let main = mainWindow() else {
             throw BridgeError("window_unavailable", "Gemini's main window is not accessible.")
@@ -393,6 +409,58 @@ final class Gemini {
         guard window().map({ CFEqual($0, main) }) == true else {
             throw BridgeError("gemini_dialog", "Close Gemini's separate dialog and bring its main window forward.")
         }
+        return main
+    }
+
+    private func hasMarker(_ marker: String) -> Bool {
+        guard let main = mainWindow() else { return false }
+        return nodes(main).contains {
+            label($0, "AXRole") == "AXHeading" && labels($0).contains { $0.hasPrefix(marker) }
+        }
+    }
+
+    private func reopenConversation(marker: String) throws -> Bool {
+        if hasMarker(marker) { return true }
+        try checkForSheet(items())
+        if let title = request.windowTitle, title.hasPrefix("Gemini - "),
+           let main = mainWindow() {
+            let name = String(title.dropFirst("Gemini - ".count))
+            guard !name.isEmpty else { return false }
+            let outline = nodes(main, skipSidebar: false).first { label($0, "AXRole") == "AXOutline" }
+            var matches = outline.map { nodes($0, skipSidebar: false).filter {
+                label($0, "AXRole") == "AXButton" && labels($0).contains(name)
+            } } ?? []
+            if matches.isEmpty, let menuBar = asAXElement(attr(root, "AXMenuBar")),
+               let conversations = nodes(menuBar).first(where: {
+                   label($0, "AXRole") == "AXMenuBarItem" &&
+                   !Set(labels($0)).isDisjoint(with: ["对话", "Conversation", "Conversations"])
+               }) {
+                matches = nodes(conversations).filter {
+                    label($0, "AXRole") == "AXMenuItem" && labels($0).contains(name)
+                }
+            }
+            if matches.count == 1 {
+                try press(matches[0])
+                if (try? waitFor("conversation_not_found", "Could not reopen the task.", seconds: 4, {
+                    self.hasMarker(marker) ? true : nil
+                })) == true { return true }
+            }
+        }
+        return false
+    }
+
+    private func prepareContinuation(_ parentMarker: String) throws {
+        _ = try focusMainWindow()
+        guard try reopenConversation(marker: parentMarker) else {
+            throw BridgeError("conversation_not_found", "The previous conversation is not visible in Gemini. Open it in Gemini and retry with a new task ID.")
+        }
+        _ = try waitFor("composer_missing", "Gemini did not expose the follow-up composer.", seconds: 4) {
+            self.composer(self.items())
+        }
+    }
+
+    private func prepareComposer() throws {
+        let main = try focusMainWindow()
         let initial = nodes(main, skipSidebar: false)
         let newChatNames = ["发起新对话", "New chat", "Start a new chat"]
         let newChat = button(initial, ["newChat_button"]) ??
@@ -570,22 +638,28 @@ final class Gemini {
         guard let message = request.message, let marker = request.marker else {
             throw BridgeError("invalid_request", "The message and task marker are required.")
         }
-        try prepareComposer()
-        if let model = request.model { try chooseModel(model) }
-        if let directory = request.directory {
-            try selectFolder(directory)
-            if let model = request.model {
-                let (popover, options) = try modelMenu()
-                try closeModelMenu(popover)
-                guard options.contains(where: { $0.name == model && $0.selected && $0.available }) else {
-                    throw BridgeError("model_not_selected", "Gemini changed the selected model after attaching the folder.")
+        if let continueMarker = request.continueMarker {
+            try prepareContinuation(continueMarker)
+            if let model = request.model { try chooseModel(model) }
+        } else {
+            try prepareComposer()
+            if let model = request.model { try chooseModel(model) }
+            if let directory = request.directory {
+                try selectFolder(directory)
+                if let model = request.model {
+                    let (popover, options) = try modelMenu()
+                    try closeModelMenu(popover)
+                    guard options.contains(where: { $0.name == model && $0.selected && $0.available }) else {
+                        throw BridgeError("model_not_selected", "Gemini changed the selected model after attaching the folder.")
+                    }
                 }
             }
         }
         let items = self.items()
         try checkForSheet(items)
-        let attached = request.directory.map { currentFolderIsNamed(folderNames(for: $0), items) } ?? true
-        guard let input = composer(items), attached, button(items, ["stop_button"]) == nil else {
+        let attached = request.continueMarker != nil ? true : (request.directory.map { currentFolderIsNamed(folderNames(for: $0), items) } ?? true)
+        let conversationMatches = request.continueMarker.map { hasMarker($0) } ?? true
+        guard let input = composer(items), attached, conversationMatches, button(items, ["stop_button"]) == nil else {
             throw BridgeError("composer_changed", "Gemini no longer has the expected task composer and directory.")
         }
         let normalizedMessage = message.replacingOccurrences(of: "\r\n", with: "\n")
@@ -604,7 +678,8 @@ final class Gemini {
         }
         let send = try matchingButton(["send_button"])
         guard label(input, "AXValue") == prompt,
-              composer(self.items()).map({ CFEqual($0, input) }) == true else {
+              composer(self.items()).map({ CFEqual($0, input) }) == true,
+              request.continueMarker.map({ hasMarker($0) }) ?? true else {
             throw BridgeError("composer_changed", "Gemini's composer changed before submission.")
         }
         try Data().write(to: armedURL, options: .atomic)
@@ -628,8 +703,19 @@ final class Gemini {
         let failed = button(toolbar, ["失败", "任务失败", "Failed", "Canceled", "Cancelled", "已取消"])
         let complete = button(toolbar, ["已完成", "Completed", "Done"])
         let stop = button(items, ["stop_button"])
-        let promptRow = ancestorRow(items[promptIndex])
-        let copy = items.dropFirst(promptIndex + 1).last { item in
+        let prompt = items[promptIndex]
+        // Older virtualized rows can omit AXParent even when they remain in AXChildren.
+        let promptRow = ancestorRow(prompt) ?? items[..<promptIndex].reversed().first { candidate in
+            label(candidate, "AXRole") == "AXRow" && nodes(candidate).contains { child in
+                label(child, "AXRole") == "AXHeading" && labels(child).contains { $0.hasPrefix(marker) }
+            }
+        }
+        let tail = items.dropFirst(promptIndex + 1)
+        let nextPrompt = tail.firstIndex {
+            label($0, "AXRole") == "AXHeading" && labels($0).contains { $0.hasPrefix("[Gemini Bridge ") }
+        }
+        let turnItems = nextPrompt.map { tail[..<$0] } ?? tail
+        let copy = turnItems.last { item in
             guard isMatchingButton(item, ["copy-button"]), let row = ancestorRow(item) else { return false }
             return promptRow.map { !CFEqual($0, row) } ?? false
         }
@@ -699,21 +785,8 @@ final class Gemini {
     func query() throws -> [String: Any] {
         guard let marker = request.marker else { throw BridgeError("invalid_request", "Missing task marker.") }
         if let observation = observation(marker: marker) { return observation }
-        try checkForSheet(items())
-        // Reopen the observed conversation only when its exact title is unique.
-        if let title = request.windowTitle, title.hasPrefix("Gemini - "),
-           let main = mainWindow() {
-            let name = String(title.dropFirst("Gemini - ".count))
-            let outline = nodes(main, skipSidebar: false).first { label($0, "AXRole") == "AXOutline" }
-            let matches = outline.map { nodes($0, skipSidebar: false).filter {
-                label($0, "AXRole") == "AXButton" && labels($0).contains(name)
-            } } ?? []
-            if !name.isEmpty && matches.count == 1 {
-                try press(matches[0])
-                if let result = try? waitFor("conversation_not_found", "Could not reopen the task.", seconds: 4, {
-                    self.observation(marker: marker)
-                }) { return result }
-            }
+        if try reopenConversation(marker: marker), let observation = observation(marker: marker) {
+            return observation
         }
         return ["status": "conversation_not_found", "detail": "The task is not visible in Gemini. Open its original task conversation and query the same task ID."]
     }

@@ -40,20 +40,24 @@ MODEL = {
     "type": "string",
     "description": "Optional exact model label returned by gemini_list_models for the same mode. Use the entire label.",
 }
+CONTINUE_FROM = {
+    "type": "string",
+    "description": "Optional prior task_id to continue in the same Gemini conversation instead of starting a new one.",
+}
 TOOLS = [
     {
         "name": "gemini_submit_task",
-        "description": "Start a fresh Gemini Desktop Task and grant that task access to the specified user-authorized local directory. Submit once and return a task ID. Poll gemini_get_result for completion.",
+        "description": "Start a fresh Gemini Desktop Task with a user-authorized local directory, or continue an existing task conversation via continue_from_task_id. Submit once and return a task ID. Poll gemini_get_result for completion.",
         "inputSchema": schema({
             "task_id": ID, "message": MESSAGE,
-            "directory": {"type": "string", "description": "Absolute path of a directory the user authorized Gemini to access."},
-            "timeout_seconds": TIMEOUT, "model": MODEL,
-        }, ["task_id", "message", "directory"]),
+            "directory": {"type": "string", "description": "Absolute path of a directory the user authorized Gemini to access. Required for a new task; optional when continuing."},
+            "timeout_seconds": TIMEOUT, "model": MODEL, "continue_from_task_id": CONTINUE_FROM,
+        }, ["task_id", "message"]),
     },
     {
         "name": "gemini_submit_chat",
-        "description": "Start a fresh regular Gemini Desktop conversation and submit one message. Poll gemini_get_result for the reply.",
-        "inputSchema": schema({"task_id": ID, "message": MESSAGE, "timeout_seconds": TIMEOUT, "model": MODEL}, ["task_id", "message"]),
+        "description": "Start a fresh regular Gemini Desktop conversation, or continue an existing chat conversation via continue_from_task_id, and submit one message. Poll gemini_get_result for the reply.",
+        "inputSchema": schema({"task_id": ID, "message": MESSAGE, "timeout_seconds": TIMEOUT, "model": MODEL, "continue_from_task_id": CONTINUE_FROM}, ["task_id", "message"]),
     },
     {
         "name": "gemini_list_models",
@@ -226,6 +230,13 @@ def validate(tool, args):
             raise ValueError(f"Invalid value for {key}: choose from {', '.join(prop['enum'])}")
     if "task_id" in args and not TASK_ID.fullmatch(args["task_id"]):
         raise ValueError("task_id must contain 1–80 ASCII letters, numbers, hyphens or underscores")
+    if "continue_from_task_id" in args:
+        if not TASK_ID.fullmatch(args["continue_from_task_id"]):
+            raise ValueError("continue_from_task_id must contain 1–80 ASCII letters, numbers, hyphens or underscores")
+        if args["continue_from_task_id"] == args.get("task_id"):
+            raise ValueError("continue_from_task_id must differ from task_id")
+    if tool["name"] == "gemini_submit_task" and "continue_from_task_id" not in args and "directory" not in args:
+        raise ValueError("directory is required when starting a new task")
     if "message" in args and (not args["message"].strip() or len(args["message"]) > 16000 or "\0" in args["message"]):
         raise ValueError("message must contain 1–16000 valid characters")
     if "model" in args and (not args["model"].strip() or len(args["model"]) > 512 or "\0" in args["model"]):
@@ -245,6 +256,9 @@ def submit(db, mode, args, existing):
     model = args.get("model")
     if model is not None:
         identity.append(model)
+    continue_from = args.get("continue_from_task_id")
+    if continue_from is not None:
+        identity.append({"continue_from_task_id": continue_from})
     fingerprint = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
     if existing:
         if existing["fingerprint"] != fingerprint:
@@ -258,6 +272,21 @@ def submit(db, mode, args, existing):
     active = db.execute("SELECT id FROM task WHERE active=1").fetchone()
     if active:
         return {"status": "busy", "active_task_id": active[0], "detail": "Query the active task before submitting another."}
+    parent = None
+    if continue_from is not None:
+        parent_row = db.execute("SELECT item FROM task WHERE id=?", (continue_from,)).fetchone()
+        if parent_row is None:
+            raise ValueError("continue_from_task_id does not match a known task")
+        parent = json.loads(parent_row[0])
+        if parent["mode"] != mode:
+            raise ValueError(f"continue_from_task_id belongs to a {parent['mode']} conversation, not {mode}")
+        if parent["status"] == "not_submitted":
+            raise ValueError("Cannot continue from a task that was not submitted")
+        if mode == "task":
+            if directory is None:
+                directory = parent.get("directory")
+            elif directory != parent.get("directory"):
+                raise ValueError("Cannot change directory when continuing an existing task")
     task_id = args["task_id"]
     marker = "[Gemini Bridge " + hashlib.sha256(task_id.encode()).hexdigest()[:20] + "]"
     item = {
@@ -271,8 +300,17 @@ def submit(db, mode, args, existing):
     }
     if model is not None:
         item["model"] = model
+    if parent is not None:
+        item["continue_from_task_id"] = continue_from
+        if parent.get("window_title"):
+            item["window_title"] = parent["window_title"]
     save(db, item)
-    result = invoke_with_foreground_recovery("submit", 38, mode=mode, model=model, directory=directory, message=args["message"], marker=marker)
+    result = invoke_with_foreground_recovery(
+        "submit", 38, mode=mode, model=model, directory=directory,
+        message=args["message"], marker=marker,
+        continueMarker=parent["marker"] if parent else None,
+        windowTitle=parent.get("window_title") if parent else None,
+    )
     submitted = result.pop("may_have_submitted", None)
     if submitted is not None:
         result["code"] = result["status"]

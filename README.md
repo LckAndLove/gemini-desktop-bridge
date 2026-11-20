@@ -33,8 +33,8 @@ agy mcp list
 
 | 工具 | 参数 | 行为 |
 | --- | --- | --- |
-| `gemini_submit_task` | `task_id`、`directory`、`message`，可选 `timeout_seconds`、`model` | 新建任务并选择真实目录。仅传入用户已同意交给 Gemini 的最小必要目录。 |
-| `gemini_submit_chat` | `task_id`、`message`，可选 `timeout_seconds`、`model` | 以普通对话模式新建会话并发送一条消息。 |
+| `gemini_submit_task` | `task_id`、`message`，新建时必填 `directory`，可选 `continue_from_task_id`、`timeout_seconds`、`model` | 新建任务并选择真实目录，或通过 `continue_from_task_id` 在原任务会话中继续追问。仅传入用户已同意交给 Gemini 的最小必要目录。 |
+| `gemini_submit_chat` | `task_id`、`message`，可选 `continue_from_task_id`、`timeout_seconds`、`model` | 以普通对话模式新建会话，或通过 `continue_from_task_id` 在原对话中继续发送消息。 |
 | `gemini_list_models` | `mode`（`chat` 或 `task`） | 空闲时实时打开该模式的模型菜单，返回当前选中、完整标签和可用状态。 |
 | `gemini_get_result` | `task_id` | 返回当前状态或完整回复。建议每隔 3–5 秒查询。 |
 | `gemini_get_weekly_quota` | 无 | 读取 Gemini 设置中的五小时与每周用量、剩余比例及重置时间。 |
