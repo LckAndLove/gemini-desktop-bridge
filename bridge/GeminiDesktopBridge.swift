@@ -76,29 +76,38 @@ final class Gemini {
     init(_ request: Request, armedURL: URL) throws {
         self.request = request
         self.armedURL = armedURL
+        let backgroundChat = request.action == "submit" && request.mode == "chat"
+        let needsForeground = request.action != "query" && !backgroundChat
         if NSRunningApplication.runningApplications(withBundleIdentifier: geminiID).isEmpty {
-            try openGemini(inBackground: request.action == "query")
+            try openGemini(inBackground: !needsForeground)
         }
         app = try waitFor("launch_failed", "Gemini Desktop did not start.", seconds: 12) {
             NSRunningApplication.runningApplications(withBundleIdentifier: geminiID).first
         }
         root = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetMessagingTimeout(root, 1.3)
-        if request.action != "query" {
-            app.activate()
-            _ = try waitFor("gemini_not_frontmost", "Gemini could not become the active app.", seconds: 4) {
-                self.app.isActive ? true : nil
-            } as Bool
-        }
+        if needsForeground { try activateGemini() }
         do {
             _ = try waitFor("window_unavailable", "Gemini has no accessible window. Unlock the Mac and check Gemini.", seconds: 12) {
                 self.window()
             }
         } catch {
             // Launch Services can return an already-running app with all windows closed.
-            try openGemini(inBackground: false)
+            try openGemini(inBackground: !needsForeground)
             _ = try waitFor("window_unavailable", "Gemini has no accessible window. Unlock the Mac and check Gemini.", seconds: 5) { self.window() }
         }
+    }
+
+    private func activateGemini() throws {
+        if app.isActive { return }
+        app.activate()
+        if (try? waitFor("gemini_not_frontmost", "Gemini could not become the active app.", seconds: 0.6, {
+            self.app.isActive ? true : nil
+        })) == true { return }
+        try openGemini(inBackground: false)
+        _ = try waitFor("gemini_not_frontmost", "Gemini could not become the active app.", seconds: 4) {
+            self.app.isActive ? true : nil
+        } as Bool
     }
 
     private func openGemini(inBackground: Bool) throws {
@@ -504,11 +513,19 @@ final class Gemini {
             throw BridgeError("composer_changed", "Gemini no longer has the expected task composer and directory.")
         }
         let prompt = "\(marker)\n\(message)"
-        _ = AXUIElementSetAttributeValue(input, "AXFocused" as CFString, kCFBooleanTrue)
         let set = AXUIElementSetAttributeValue(input, "AXValue" as CFString, prompt as CFString)
-        if set != .success || label(input, "AXValue") != prompt { try paste(prompt) }
+        if set != .success || label(input, "AXValue") != prompt {
+            try activateGemini()
+            try checkForSheet(self.items())
+            guard composer(self.items()).map({ CFEqual($0, input) }) == true else {
+                throw BridgeError("composer_changed", "The Gemini composer changed before pasting.")
+            }
+            _ = AXUIElementSetAttributeValue(input, "AXFocused" as CFString, kCFBooleanTrue)
+            try paste(prompt)
+        }
         let send = try matchingButton(["send_button"])
-        guard label(input, "AXValue") == prompt, app.isActive else {
+        guard label(input, "AXValue") == prompt,
+              composer(self.items()).map({ CFEqual($0, input) }) == true else {
             throw BridgeError("composer_changed", "Gemini's composer changed before submission.")
         }
         try Data().write(to: armedURL, options: .atomic)
