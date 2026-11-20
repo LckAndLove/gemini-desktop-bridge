@@ -144,7 +144,11 @@ def invoke(action, budget, **request):
                             "status": "helper_launch_failed", "detail": exit_result["detail"],
                             "may_have_submitted": action == "submit",
                         }
-                    break
+                    return {
+                        "status": "helper_exited_without_response",
+                        "detail": "The Accessibility helper exited without writing a response.",
+                        "may_have_submitted": action == "submit" and (folder / "armed").is_file(),
+                    }
                 time.sleep(0.12)
         return {
             "status": "helper_timeout",

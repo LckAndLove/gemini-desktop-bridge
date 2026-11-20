@@ -148,6 +148,34 @@ server.run_helper(folder, Path(sys.argv[3]))
         self.assertFalse(folder.exists())
         self.assertEqual(server.call("gemini_submit_chat", args)["status"], "submission_unknown")
 
+    def test_swift_quota_parser_keeps_matching_percentages(self):
+        project = Path(__file__).resolve().parents[1]
+        source = (project / "bridge/GeminiDesktopBridge.swift").read_text()
+        fixture = (project / "tests/quota/main.swift").read_text()
+        subprocess.run(
+            ["/usr/bin/swift", "-D", "BRIDGE_PARSER_TEST", "-"],
+            input=source + "\n" + fixture, text=True, check=True, timeout=30,
+        )
+
+    def test_helper_exit_without_response_is_not_timeout(self):
+        helper = Path(self.tmp.name) / "fake.app"
+        helper.mkdir()
+
+        for armed in (False, True):
+            with self.subTest(armed=armed):
+                def write_exit(command, **kwargs):
+                    folder = Path(command[3])
+                    if armed:
+                        (folder / "armed").touch()
+                    (folder / "exit.json").write_text(json.dumps({"returncode": 0, "detail": ""}))
+                    return mock.Mock()
+
+                with mock.patch.object(server, "HELPER", helper), \
+                     mock.patch.object(server.subprocess, "Popen", side_effect=write_exit):
+                    result = server.invoke("submit", 5)
+                self.assertEqual(result["status"], "helper_exited_without_response")
+                self.assertIs(result["may_have_submitted"], armed)
+
     def test_submit_normalizes_directory_fingerprint(self):
         with mock.patch.object(server, "invoke_with_foreground_recovery", return_value={"status": "running"}) as mocked:
             first = server.call("gemini_submit_task", {

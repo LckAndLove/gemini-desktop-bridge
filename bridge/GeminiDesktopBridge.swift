@@ -69,6 +69,51 @@ func sleepBriefly() {
     RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.12))
 }
 
+func parseQuotaLabels(_ labelGroups: [[String]]) -> (fiveHour: [String: Any], weekly: [String: Any]) {
+    let text = labelGroups.flatMap { group in
+        var seen = Set<String>()
+        return group.filter { !$0.isEmpty && seen.insert($0).inserted }
+    }.joined(separator: " ")
+    // Google labels the five-hour card "Current usage" in this desktop UI.
+    let fiveHour = #"(?i)(?:五小时限额|5\s*小时限额|5[- ]hour (?:limit(?:s)?|usage)|five[- ]hour (?:limit(?:s)?|usage)|当前用量|current usage)\s*[:：]?\s*"#
+    let weekly = #"(?i)(?:每周限额|weekly limit(?:s)?|weekly usage)\s*[:：]?\s*"#
+    let used = #"(?i)(?:已使用\s*(\d{1,3})\s*%|(\d{1,3})\s*%\s*used|used\s*(\d{1,3})\s*%)"#
+    let remaining = #"(?i)(?:剩余\s*(\d{1,3})\s*%|(\d{1,3})\s*%\s*(?:remaining|left))"#
+    let reset = #"(?i)(?:重置时间\s*[:：]?|reset time\s*:?|resets?\s*(?:at|on|:)?)[ \t]*([^\n%]{0,80}?\d{1,2}:\d{2}(?:[ \t]*[ap]\.?m\.?)?)"#
+    func groups(_ pattern: String, _ text: String) -> [String] {
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) else { return [] }
+        return (1..<match.numberOfRanges).compactMap { Range(match.range(at: $0), in: text).map { String(text[$0]) } }
+    }
+    let footer = #"(?i)使用 AI 点数|高级设置|AI (?:points|credits)|advanced settings|learn more"#
+
+    func quotaSection(_ text: String, heading: String) -> String? {
+        guard let start = text.range(of: heading, options: .regularExpression) else { return nil }
+        let rest = text[start.upperBound...]
+        let boundary = [fiveHour, weekly, footer].compactMap {
+            rest.range(of: $0, options: .regularExpression)?.lowerBound
+        }.min() ?? rest.endIndex
+        return rest[..<boundary].trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func fields(_ section: String?) -> [String: Any] {
+        let text = section ?? ""
+        let usedPercent = groups(used, text).compactMap(Int.init).first { (0...100).contains($0) }
+        let shownRemaining = groups(remaining, text).compactMap(Int.init).first { (0...100).contains($0) }
+        let remainingPercent = shownRemaining ?? usedPercent.map { 100 - $0 }
+        let resetText = groups(reset, text).first?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return [
+            "status": remainingPercent != nil && resetText != nil ? "ready" : "quota_fields_unavailable",
+            "remaining_percent": remainingPercent as Any? ?? NSNull(),
+            "remaining_source": shownRemaining != nil ? "displayed" : (usedPercent != nil ? "100_minus_displayed_used_percent" : "unavailable"),
+            "used_percent": usedPercent as Any? ?? NSNull(),
+            "reset_display": resetText as Any? ?? NSNull()
+        ]
+    }
+
+    return (fields(quotaSection(text, heading: fiveHour)), fields(quotaSection(text, heading: weekly)))
+}
+
 final class Gemini {
     private let request: Request
     private let armedURL: URL
@@ -224,15 +269,33 @@ final class Gemini {
     private func selectFolder(_ path: String) throws {
         let name = URL(fileURLWithPath: path).lastPathComponent
         try press(matchingButton(["文件夹", "Folders", "Folder"]), allowTimeout: true)
-        try press(matchingButton(["添加新文件夹…", "添加新文件夹", "Add new folder…", "Add new folder...", "Add New Folder…"]))
-        let panel = try waitFor("picker_missing", "Gemini did not open the directory picker.", seconds: 5) {
-            self.window().flatMap {
-                label($0, "AXIdentifier") == "open-panel" && button(nodes($0), ["OKButton"]) != nil ? $0 : nil
+        let addFolder = try matchingButton(["添加新文件夹…", "添加新文件夹", "Add new folder…", "Add new folder...", "Add New Folder…"])
+        guard let originalWindows = attr(root, "AXWindows") as? [AXUIElement] else {
+            throw BridgeError("picker_missing", "Could not inspect Gemini windows before opening the directory picker.")
+        }
+        func openedPanel() -> AXUIElement? {
+            let candidates = (attr(root, "AXWindows") as? [AXUIElement] ?? []).filter { candidate in
+                label(candidate, "AXIdentifier") == "open-panel" &&
+                !originalWindows.contains { CFEqual($0, candidate) }
+            }
+            return candidates.count == 1 ? candidates[0] : nil
+        }
+        var ownedPanel: AXUIElement?
+        defer {
+            if let panel = ownedPanel ?? openedPanel(),
+               (attr(root, "AXWindows") as? [AXUIElement])?.contains(where: { CFEqual($0, panel) }) == true {
+                cancelFolderPanel(panel)
             }
         }
+        try press(addFolder)
+        let panel = try waitFor("picker_missing", "Gemini did not open the directory picker.", seconds: 5) {
+            openedPanel().flatMap { button(nodes($0), ["OKButton"]) != nil ? $0 : nil }
+        }
+        ownedPanel = panel
         try key(5, flags: [.maskCommand, .maskShift])
         let pathField = try waitFor("path_input_missing", "The open panel did not show Go to Folder.", seconds: 4) {
-            self.items().first { label($0, "AXRole") == "AXSheet" }
+            guard let current = self.window(), CFEqual(current, panel) else { return nil as AXUIElement? }
+            return nodes(panel).first { label($0, "AXRole") == "AXSheet" }
         }
         try key(0, flags: .maskCommand)
         try paste(path)
@@ -268,6 +331,33 @@ final class Gemini {
             }
             return nil
         } as Bool
+    }
+
+    private func cancelFolderPanel(_ panel: AXUIElement) {
+        // AX cleanup is scoped to this picker and can run after the request deadline.
+        let deadline = Date().addingTimeInterval(1)
+        if let sheet = nodes(panel).first(where: { label($0, "AXRole") == "AXSheet" }) {
+            if AXUIElementPerformAction(sheet, "AXCancel" as CFString) != .success {
+                if let cancel = button(nodes(sheet), ["CancelButton", "取消", "Cancel"]) {
+                    _ = AXUIElementPerformAction(cancel, "AXPress" as CFString)
+                } else if app.isActive, CGPreflightPostEventAccess(),
+                          let focused = window(), CFEqual(focused, panel) || CFEqual(focused, sheet) {
+                    for down in [true, false] {
+                        CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: down)?
+                            .postToPid(app.processIdentifier)
+                    }
+                }
+            }
+        }
+        repeat {
+            let controls = nodes(panel)
+            if !controls.contains(where: { label($0, "AXRole") == "AXSheet" }),
+               let cancel = button(controls, ["CancelButton", "取消", "Cancel"]) {
+                _ = AXUIElementPerformAction(cancel, "AXPress" as CFString)
+                return
+            }
+            sleepBriefly()
+        } while Date() < deadline
     }
 
     private func isSettingsWindow(_ window: AXUIElement) -> Bool {
@@ -436,58 +526,19 @@ final class Gemini {
             let selected = AXUIElementSetAttributeValue(row, "AXSelected" as CFString, kCFBooleanTrue)
             if selected != .success { try press(row) }
         }
-        // Google labels the five-hour card "Current usage" in this desktop UI.
-        let fiveHour = #"(?i)(?:五小时限额|5\s*小时限额|5[- ]hour (?:limit(?:s)?|usage)|five[- ]hour (?:limit(?:s)?|usage)|当前用量|current usage)\s*[:：]?\s*"#
-        let weekly = #"(?i)(?:每周限额|weekly limit(?:s)?|weekly usage)\s*[:：]?\s*"#
-        let used = #"(?i)(?:已使用\s*(\d{1,3})\s*%|(\d{1,3})\s*%\s*used|used\s*(\d{1,3})\s*%)"#
-        let remaining = #"(?i)(?:剩余\s*(\d{1,3})\s*%|(\d{1,3})\s*%\s*(?:remaining|left))"#
-        let reset = #"(?i)(?:重置时间\s*[:：]?|reset time\s*:?|resets?\s*(?:at|on|:)?)[ \t]*([^\n%]{0,80}?\d{1,2}:\d{2}(?:[ \t]*[ap]\.?m\.?)?)"#
-        func groups(_ pattern: String, _ text: String) -> [String] {
-            guard let regex = try? NSRegularExpression(pattern: pattern),
-                  let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) else { return [] }
-            return (1..<match.numberOfRanges).compactMap { Range(match.range(at: $0), in: text).map { String(text[$0]) } }
-        }
-        let footer = #"(?i)使用 AI 点数|高级设置|AI (?:points|credits)|advanced settings|learn more"#
-
-        func quotaSection(_ text: String, heading: String) -> String? {
-            guard let start = text.range(of: heading, options: .regularExpression) else { return nil }
-            let rest = text[start.upperBound...]
-            let boundary = [fiveHour, weekly, footer].compactMap {
-                rest.range(of: $0, options: .regularExpression)?.lowerBound
-            }.min() ?? rest.endIndex
-            return rest[..<boundary].trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-
-        func fields(_ section: String?) -> [String: Any] {
-            let text = section ?? ""
-            let usedPercent = groups(used, text).compactMap(Int.init).first { (0...100).contains($0) }
-            let shownRemaining = groups(remaining, text).compactMap(Int.init).first { (0...100).contains($0) }
-            let remainingPercent = shownRemaining ?? usedPercent.map { 100 - $0 }
-            let resetText = groups(reset, text).first?.trimmingCharacters(in: .whitespacesAndNewlines)
-            return [
-                "status": remainingPercent != nil && resetText != nil ? "ready" : "quota_fields_unavailable",
-                "remaining_percent": remainingPercent as Any? ?? NSNull(),
-                "remaining_source": shownRemaining != nil ? "displayed" : (usedPercent != nil ? "100_minus_displayed_used_percent" : "unavailable"),
-                "used_percent": usedPercent as Any? ?? NSNull(),
-                "reset_display": resetText as Any? ?? NSNull()
-            ]
-        }
-
-        var short: [String: Any] = fields(nil)
-        var week: [String: Any] = fields(nil)
+        var periods = parseQuotaLabels([])
         _ = try? waitFor("quota_fields_unavailable", "Gemini did not expose both usage periods.", seconds: 7) {
-            var seen = Set<String>()
-            let text = nodes(settings).filter {
+            let labelGroups = nodes(settings).filter {
                 ["AXStaticText", "AXGroup", "AXHeading", "AXProgressIndicator"].contains(label($0, "AXRole"))
-            }.flatMap(labels).filter { !$0.isEmpty && seen.insert($0).inserted }.joined(separator: " ")
-            short = fields(quotaSection(text, heading: fiveHour))
-            week = fields(quotaSection(text, heading: weekly))
-            return (short["status"] as? String) == "ready" && (week["status"] as? String) == "ready" ? true : nil
+            }.map(labels)
+            periods = parseQuotaLabels(labelGroups)
+            return (periods.fiveHour["status"] as? String) == "ready" &&
+                (periods.weekly["status"] as? String) == "ready" ? true : nil
         } as Bool
         // Keep the original top-level fields, including status, scoped to weekly usage.
-        var result = week
-        result["five_hour"] = short
-        result["weekly"] = week
+        var result = periods.weekly
+        result["five_hour"] = periods.fiveHour
+        result["weekly"] = periods.weekly
         return result
     }
 
@@ -657,6 +708,7 @@ func respond(_ payload: [String: Any], to path: URL) throws {
     try JSONSerialization.data(withJSONObject: payload).write(to: path, options: .atomic)
 }
 
+#if !BRIDGE_PARSER_TEST
 let arguments = CommandLine.arguments
 guard arguments.count == 3, arguments[1] == "--request" else {
     let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
@@ -704,3 +756,4 @@ do {
         "may_have_submitted": FileManager.default.fileExists(atPath: armedURL.path)
     ], to: responseURL)
 }
+#endif
