@@ -107,7 +107,11 @@ def invoke(action, budget, **request):
             time.sleep(0.12)
         return {
             "status": "helper_timeout",
-            "detail": "No response from the Accessibility helper. Query the same task ID before attempting any new submission.",
+            "detail": (
+                "No response from the Accessibility helper. Query the same task ID before attempting any new submission."
+                if action == "submit"
+                else "No response from the Accessibility helper. Check that the Mac is unlocked before retrying."
+            ),
             "may_have_submitted": action == "submit",
         }
 

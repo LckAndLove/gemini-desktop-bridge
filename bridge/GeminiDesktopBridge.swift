@@ -257,9 +257,25 @@ final class Gemini {
         } as Bool
     }
 
+    private func isSettingsWindow(_ window: AXUIElement) -> Bool {
+        nodes(window, skipSidebar: false).contains {
+            label($0, "AXIdentifier") == "settings_search_field"
+        }
+    }
+
     private func prepareComposer() throws {
         try checkForSheet(items())
-        guard let main = mainWindow(), window().map({ CFEqual($0, main) }) == true else {
+        guard let main = mainWindow() else {
+            throw BridgeError("window_unavailable", "Gemini's main window is not accessible.")
+        }
+        if let focused = window(), !CFEqual(focused, main), isSettingsWindow(focused) {
+            try checkForSheet(nodes(main))
+            _ = AXUIElementPerformAction(main, "AXRaise" as CFString)
+            _ = try waitFor("gemini_main_window_not_focused", "Bring Gemini's main window forward and retry.", seconds: 3) {
+                self.window().map { CFEqual($0, main) } == true ? true : nil
+            } as Bool
+        }
+        guard window().map({ CFEqual($0, main) }) == true else {
             throw BridgeError("gemini_dialog", "Close Gemini's separate dialog and bring its main window forward.")
         }
         let initial = nodes(main, skipSidebar: false)
@@ -351,18 +367,13 @@ final class Gemini {
         func windows() -> [AXUIElement]? {
             attr(root, "AXWindows") as? [AXUIElement]
         }
-        func isSettings(_ window: AXUIElement) -> Bool {
-            nodes(window, skipSidebar: false).contains {
-                label($0, "AXIdentifier") == "settings_search_field"
-            }
-        }
         guard let originalWindows = windows() else {
             throw BridgeError("quota_settings_unavailable", "Could not inspect Gemini's windows before opening settings.")
         }
-        let existing = originalWindows.first(where: isSettings)
+        let existing = originalWindows.first(where: isSettingsWindow)
         func openedSettings() -> AXUIElement? {
             windows()?.first { candidate in
-                !originalWindows.contains { CFEqual($0, candidate) } && isSettings(candidate)
+                !originalWindows.contains { CFEqual($0, candidate) } && isSettingsWindow(candidate)
             }
         }
         var openingRequested = false
