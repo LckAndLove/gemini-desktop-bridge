@@ -150,8 +150,8 @@ server.run_helper(folder, Path(sys.argv[3]))
 
     def test_swift_quota_parser_keeps_matching_percentages(self):
         project = Path(__file__).resolve().parents[1]
-        source = (project / "bridge/GeminiDesktopBridge.swift").read_text()
-        fixture = (project / "tests/quota/main.swift").read_text()
+        source = (project / "bridge/GeminiDesktopBridge.swift").read_text(encoding="utf-8")
+        fixture = (project / "tests/quota/main.swift").read_text(encoding="utf-8")
         subprocess.run(
             ["/usr/bin/swift", "-D", "BRIDGE_PARSER_TEST", "-"],
             input=source + "\n" + fixture, text=True, check=True, timeout=30,
@@ -210,6 +210,13 @@ server.run_helper(folder, Path(sys.argv[3]))
         self.assertEqual(diag["status"], "submission_unknown")
         self.assertEqual(diag["code"], "window_unavailable")
         self.assertEqual(diag["detail"], "Unlock Mac")
+
+        # Transient error without detail must not leak stale detail from the persisted state.
+        with mock.patch.object(server, "invoke", return_value={"status": "helper_busy"}):
+            no_detail = server.call("gemini_get_result", {"task_id": "chat-1"})
+        self.assertEqual(no_detail["status"], "submission_unknown")
+        self.assertEqual(no_detail["code"], "helper_busy")
+        self.assertNotIn("detail", no_detail)
 
         # Subsequent conversation_not_found must still preserve submission_unknown.
         with mock.patch.object(

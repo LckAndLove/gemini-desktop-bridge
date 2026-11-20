@@ -301,6 +301,7 @@ def get_result(db, item):
             return expose(item)
         # Report transient helper/UI diagnostic errors without overwriting the persisted task state.
         response = expose(item)
+        response.pop("detail", None)
         response["code"] = status
         if "detail" in observed:
             response["detail"] = observed["detail"]

@@ -87,10 +87,10 @@ func parseQuotaLabels(_ labelGroups: [[String]]) -> (fiveHour: [String: Any], we
     }
     let footer = #"(?i)使用 AI 点数|高级设置|AI (?:points|credits)|advanced settings|learn more"#
 
-    func quotaSection(_ text: String, heading: String) -> String? {
+    func quotaSection(_ text: String, heading: String, stopAt boundaries: [String]) -> String? {
         guard let start = text.range(of: heading, options: .regularExpression) else { return nil }
         let rest = text[start.upperBound...]
-        let boundary = [fiveHour, weekly, footer].compactMap {
+        let boundary = boundaries.compactMap {
             rest.range(of: $0, options: .regularExpression)?.lowerBound
         }.min() ?? rest.endIndex
         return rest[..<boundary].trimmingCharacters(in: .whitespacesAndNewlines)
@@ -111,7 +111,10 @@ func parseQuotaLabels(_ labelGroups: [[String]]) -> (fiveHour: [String: Any], we
         ]
     }
 
-    return (fields(quotaSection(text, heading: fiveHour)), fields(quotaSection(text, heading: weekly)))
+    return (
+        fields(quotaSection(text, heading: fiveHour, stopAt: [weekly, footer])),
+        fields(quotaSection(text, heading: weekly, stopAt: [fiveHour, footer]))
+    )
 }
 
 final class Gemini {
@@ -262,12 +265,18 @@ final class Gemini {
         }
     }
 
-    private func currentFolderIsNamed(_ name: String, _ items: [AXUIElement]) -> Bool {
-        button(items, [name]) != nil && button(items, ["移除", "Remove"]) != nil
+    private func folderNames(for path: String) -> [String] {
+        let raw = URL(fileURLWithPath: path).lastPathComponent
+        let display = FileManager.default.displayName(atPath: path)
+        return raw == display ? [raw] : [raw, display]
+    }
+
+    private func currentFolderIsNamed(_ names: [String], _ items: [AXUIElement]) -> Bool {
+        button(items, names) != nil && button(items, ["移除", "Remove"]) != nil
     }
 
     private func selectFolder(_ path: String) throws {
-        let name = URL(fileURLWithPath: path).lastPathComponent
+        let names = folderNames(for: path)
         try press(matchingButton(["文件夹", "Folders", "Folder"]), allowTimeout: true)
         let addFolder = try matchingButton(["添加新文件夹…", "添加新文件夹", "Add new folder…", "Add new folder...", "Add New Folder…"])
         guard let originalWindows = attr(root, "AXWindows") as? [AXUIElement] else {
@@ -281,8 +290,10 @@ final class Gemini {
             return candidates.count == 1 ? candidates[0] : nil
         }
         var ownedPanel: AXUIElement?
+        var attached = false
         defer {
-            if let panel = ownedPanel ?? openedPanel(),
+            if !attached,
+               let panel = ownedPanel ?? openedPanel(),
                (attr(root, "AXWindows") as? [AXUIElement])?.contains(where: { CFEqual($0, panel) }) == true {
                 cancelFolderPanel(panel)
             }
@@ -308,21 +319,21 @@ final class Gemini {
             let items = nodes(current)
             guard !items.contains(where: { label($0, "AXRole") == "AXSheet" }) else { return nil }
             let navigated = items.contains {
-                label($0, "AXIdentifier") == "where popup" && label($0, "AXValue") == name
+                label($0, "AXIdentifier") == "where popup" && names.contains(label($0, "AXValue"))
             }
             return navigated ? button(items, ["OKButton"]) : nil
         }
         try press(choose)
         _ = try waitFor("directory_not_attached", "Gemini did not attach the directory.", seconds: 6) {
             let items = self.items()
-            if self.currentFolderIsNamed(name, items) { return true }
+            if self.currentFolderIsNamed(names, items) { return true }
             let sheet = items.first { label($0, "AXRole") == "AXSheet" }
             if let sheet {
                 let all = nodes(sheet)
                 let confirmation = all.contains { item in
-                    label(item, "AXRole") == "AXStaticText" && labels(item).contains {
-                        $0.contains(name) &&
-                        ($0.contains("要允许 Gemini 访问") || $0.localizedCaseInsensitiveContains("allow Gemini to access"))
+                    label(item, "AXRole") == "AXStaticText" && labels(item).contains { text in
+                        names.contains { text.contains($0) } &&
+                        (text.contains("要允许 Gemini 访问") || text.localizedCaseInsensitiveContains("allow Gemini to access"))
                     }
                 }
                 if confirmation, let allow = button(all, ["允许", "Allow"]) {
@@ -331,6 +342,7 @@ final class Gemini {
             }
             return nil
         } as Bool
+        attached = true
     }
 
     private func cancelFolderPanel(_ panel: AXUIElement) {
@@ -344,7 +356,7 @@ final class Gemini {
                           let focused = window(), CFEqual(focused, panel) || CFEqual(focused, sheet) {
                     for down in [true, false] {
                         CGEvent(keyboardEventSource: nil, virtualKey: 53, keyDown: down)?
-                            .postToPid(app.processIdentifier)
+                            .post(tap: .cghidEventTap)
                     }
                 }
             }
@@ -572,11 +584,13 @@ final class Gemini {
         }
         let items = self.items()
         try checkForSheet(items)
-        let attached = request.directory.map { currentFolderIsNamed(URL(fileURLWithPath: $0).lastPathComponent, items) } ?? true
+        let attached = request.directory.map { currentFolderIsNamed(folderNames(for: $0), items) } ?? true
         guard let input = composer(items), attached, button(items, ["stop_button"]) == nil else {
             throw BridgeError("composer_changed", "Gemini no longer has the expected task composer and directory.")
         }
-        let prompt = "\(marker)\n\(message)"
+        let normalizedMessage = message.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let prompt = "\(marker)\n\(normalizedMessage)"
         let set = AXUIElementSetAttributeValue(input, "AXValue" as CFString, prompt as CFString)
         if set != .success || label(input, "AXValue") != prompt {
             try activateGemini()
@@ -656,7 +670,8 @@ final class Gemini {
 
     private func replyText(_ copy: AXUIElement) -> String? {
         var fragments: [String] = []
-        func collect(_ element: AXUIElement) {
+        func collect(_ element: AXUIElement, depth: Int = 0) {
+            guard depth < 28 else { return }
             let role = label(element, "AXRole")
             guard !["AXButton", "AXMenuButton", "AXMenu", "AXToolbar"].contains(role) else { return }
             if role == "AXStaticText", let content = labels(element).first(where: {
@@ -665,7 +680,7 @@ final class Gemini {
                 fragments.append(content)
                 return
             }
-            for child in attr(element, "AXChildren") as? [AXUIElement] ?? [] { collect(child) }
+            for child in attr(element, "AXChildren") as? [AXUIElement] ?? [] { collect(child, depth: depth + 1) }
         }
         if let row = ancestorRow(copy) { collect(row) }
         let axText = fragments.isEmpty ? nil : fragments.joined(separator: "\n")
