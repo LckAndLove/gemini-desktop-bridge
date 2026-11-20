@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import time
 import unittest
@@ -82,6 +83,70 @@ class ServerTest(unittest.TestCase):
                         server.call("gemini_get_result", {"task_id": "first"})
                 with self.assertRaises(ValueError):
                     server.call("gemini_release", {"task_id": "first", "confirmed": True})
+
+    def test_timeout_preserves_armed_file_until_exit_and_never_resubmits(self):
+        helper = Path(self.tmp.name) / "fake.app"
+        helper.mkdir()
+        worker_code = """
+from pathlib import Path
+import subprocess
+import sys
+import time
+sys.path.insert(0, str(Path(sys.argv[1]).parent))
+import server
+folder = Path(sys.argv[2])
+def fake_open(*args, **kwargs):
+    assert "-W" in args[0]
+    (folder / "armed").touch()
+    limit = time.monotonic() + 8
+    while not (folder.parent / "helper-can-exit").exists() and time.monotonic() < limit:
+        time.sleep(0.01)
+    assert (folder / "armed").is_file()
+    assert (folder / "request.json").is_file()
+    (folder.parent / "helper-saw-armed").touch()
+    return subprocess.CompletedProcess(args[0], 0, "", "")
+server.subprocess.run = fake_open
+server.run_helper(folder, Path(sys.argv[3]))
+"""
+        real_popen = subprocess.Popen
+        real_invoke = server.invoke
+        workers = []
+
+        def launch_worker(command, **kwargs):
+            worker = real_popen(
+                [command[0], "-c", worker_code, command[1], command[3], command[4]], **kwargs
+            )
+            workers.append(worker)
+            return worker
+
+        def wait_for(path):
+            limit = time.monotonic() + 4
+            while not path.exists() and time.monotonic() < limit:
+                time.sleep(0.01)
+            self.assertTrue(path.exists(), str(path))
+
+        args = {"task_id": "timeout-armed", "message": "hello"}
+        try:
+            with mock.patch.object(server, "HELPER", helper), \
+                 mock.patch.object(server.subprocess, "Popen", side_effect=launch_worker), \
+                 mock.patch.object(server, "invoke", side_effect=lambda action, _, **kw: real_invoke(action, -1.7, **kw)):
+                first = server.call("gemini_submit_chat", args)
+                self.assertEqual(first["code"], "helper_timeout")
+                self.assertEqual(first["status"], "submission_unknown")
+                folder, = self.support.glob("call-*")
+                wait_for(folder / "armed")
+                self.assertTrue((folder / "request.json").is_file())
+                repeated = server.call("gemini_submit_chat", args)
+                self.assertEqual(repeated["status"], "submission_unknown")
+                self.assertEqual(len(workers), 1)
+                self.assertIsNone(workers[0].poll())
+        finally:
+            (self.support / "helper-can-exit").touch()
+            for worker in workers:
+                worker.wait(timeout=10)
+        wait_for(self.support / "helper-saw-armed")
+        self.assertFalse(folder.exists())
+        self.assertEqual(server.call("gemini_submit_chat", args)["status"], "submission_unknown")
 
     def test_submit_normalizes_directory_fingerprint(self):
         with mock.patch.object(server, "invoke_with_foreground_recovery", return_value={"status": "running"}) as mocked:

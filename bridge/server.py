@@ -8,10 +8,12 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 SUPPORT = Path.home() / "Library/Application Support/Gemini Desktop Bridge"
@@ -83,29 +85,67 @@ TOOLS = [
 ]
 
 
+def run_helper(folder, helper):
+    """Own the request directory until both the app and its caller finish."""
+    with (folder / "caller.lock").open("r+") as caller:
+        try:
+            launch = subprocess.run(
+                ["/usr/bin/open", "-W", "-g", "-n", str(helper), "--args",
+                 "--request", str(folder / "request.json")],
+                capture_output=True, text=True,
+            )
+            result = {"returncode": launch.returncode, "detail": launch.stderr.strip()}
+        except OSError as error:
+            result = {"returncode": -1, "detail": str(error)}
+        try:
+            pending = folder / "exit.tmp"
+            pending.write_text(json.dumps(result), encoding="utf-8")
+            pending.replace(folder / "exit.json")
+        finally:
+            # open -W has finished. The lock also survives a caller timeout or exit.
+            fcntl.flock(caller, fcntl.LOCK_EX)
+            shutil.rmtree(folder)
+
+
 def invoke(action, budget, **request):
     if not HELPER.is_dir():
         return {"status": "helper_missing", "detail": f"Install the helper at {HELPER}.", "may_have_submitted": False}
     SUPPORT.mkdir(mode=0o700, parents=True, exist_ok=True)
     deadline = time.time() + budget
-    with tempfile.TemporaryDirectory(prefix="call-", dir=SUPPORT) as tmp:
-        folder = Path(tmp)
-        payload = folder / "request.json"
-        payload.write_text(json.dumps(dict(request, action=action, deadline=deadline)), encoding="utf-8")
-        response = folder / "response.json"
-        try:
-            launch = subprocess.run(
-                ["/usr/bin/open", "-g", "-n", str(HELPER), "--args", "--request", str(payload)],
-                capture_output=True, text=True, timeout=5,
+    folder = Path(tempfile.mkdtemp(prefix="call-", dir=SUPPORT))
+    worker = None
+    try:
+        with (folder / "caller.lock").open("w") as caller:
+            fcntl.flock(caller, fcntl.LOCK_EX)
+            (folder / "request.json").write_text(
+                json.dumps(dict(request, action=action, deadline=deadline)), encoding="utf-8"
             )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            return {"status": "helper_launch_uncertain", "detail": str(error), "may_have_submitted": action == "submit"}
-        if launch.returncode:
-            return {"status": "helper_launch_failed", "detail": launch.stderr.strip(), "may_have_submitted": action == "submit"}
-        while time.time() < deadline + 2:
-            if response.is_file():
-                return json.loads(response.read_text(encoding="utf-8"))
-            time.sleep(0.12)
+            try:
+                worker = subprocess.Popen(
+                    [sys.executable, str(Path(__file__).resolve()), "--run-helper", str(folder), str(HELPER)],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError as error:
+                return {"status": "helper_launch_uncertain", "detail": str(error), "may_have_submitted": action == "submit"}
+            threading.Thread(target=worker.wait, daemon=True).start()
+            response = folder / "response.json"
+            exit_status = folder / "exit.json"
+            while time.time() < deadline + 2:
+                if response.is_file():
+                    return json.loads(response.read_text(encoding="utf-8"))
+                if exit_status.is_file():
+                    # The response can appear between the first check and the exit record.
+                    if response.is_file():
+                        return json.loads(response.read_text(encoding="utf-8"))
+                    exit_result = json.loads(exit_status.read_text(encoding="utf-8"))
+                    if exit_result["returncode"]:
+                        return {
+                            "status": "helper_launch_failed", "detail": exit_result["detail"],
+                            "may_have_submitted": action == "submit",
+                        }
+                    break
+                time.sleep(0.12)
         return {
             "status": "helper_timeout",
             "detail": (
@@ -115,6 +155,9 @@ def invoke(action, budget, **request):
             ),
             "may_have_submitted": action == "submit",
         }
+    finally:
+        if worker is None:
+            shutil.rmtree(folder)
 
 
 def invoke_with_foreground_recovery(action, budget, **request):
@@ -368,4 +411,10 @@ def run():
 
 
 if __name__ == "__main__":
-    run()
+    if len(sys.argv) == 4 and sys.argv[1] == "--run-helper":
+        folder = Path(sys.argv[2])
+        if folder.parent != SUPPORT or not folder.name.startswith("call-") or folder.is_symlink():
+            sys.exit("Invalid helper request directory")
+        run_helper(folder, Path(sys.argv[3]))
+    else:
+        run()
