@@ -61,7 +61,7 @@ TOOLS = [
     },
     {
         "name": "gemini_list_models",
-        "description": "Read selectable models in a fresh Gemini Desktop composer for the specified mode. Use while the bridge is idle.",
+        "description": "List only models available to the signed-in account in the specified Gemini Desktop mode. Use while the bridge is idle.",
         "inputSchema": schema({"mode": {"type": "string", "enum": ["chat", "task"]}}, ["mode"]),
     },
     {

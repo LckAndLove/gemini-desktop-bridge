@@ -35,7 +35,7 @@ agy mcp list
 | --- | --- | --- |
 | `gemini_submit_task` | `task_id`、`message`，新建时必填 `directory`，可选 `continue_from_task_id`、`timeout_seconds`、`model` | 新建任务并选择真实目录，或通过 `continue_from_task_id` 在原任务会话中继续追问。仅传入用户已同意交给 Gemini 的最小必要目录。 |
 | `gemini_submit_chat` | `task_id`、`message`，可选 `continue_from_task_id`、`timeout_seconds`、`model` | 以普通对话模式新建会话，或通过 `continue_from_task_id` 在原对话中继续发送消息。 |
-| `gemini_list_models` | `mode`（`chat` 或 `task`） | 空闲时实时打开该模式的模型菜单，返回当前选中、完整标签和可用状态。 |
+| `gemini_list_models` | `mode`（`chat` 或 `task`） | 空闲时实时打开该模式的模型菜单，只返回当前账号可切换到的模型及其完整标签，并标记当前选中项。 |
 | `gemini_get_result` | `task_id` | 返回当前状态或完整回复。建议每隔 3–5 秒查询。 |
 | `gemini_get_weekly_quota` | 无 | 读取 Gemini 设置中的五小时与每周用量、剩余比例及重置时间。 |
 | `gemini_health` | 无 | 检查本机辅助功能、键盘权限和辅助应用。 |
@@ -49,7 +49,7 @@ agy mcp list
 
 额度工具返回 `five_hour` 与 `weekly`，两个对象各自报告状态、用量、剩余比例和界面显示的重置时间。顶层字段继续对应周额度，兼容原有调用。界面只显示已使用百分比时，剩余比例按 `100 - 已使用百分比` 计算，并用 `remaining_source` 标明来源。缺失值返回 `null`。查询使用 Gemini 原生设置页。调用结束时会尝试关闭本次查询打开的设置窗口，已打开的设置窗口会保留。Google 将「当前用量」对应的短周期说明为五小时。[Gemini 官方额度说明](https://support.google.com/gemini/answer/16275805)
 
-指定模型时先调用 `gemini_list_models`，再将可用条目的完整 `label` 填为 `model`。提交前会在当前界面核对菜单确实已选中该项。省略模型时沿用 Gemini 当前选择。模型列表会随账户和模式变化。查询会切换到一个新的空白输入页，且不会发送消息。
+指定模型时先调用 `gemini_list_models`，再将可用条目的完整 `label` 填为 `model`。提交时通过 Gemini 的「下一个模型」快捷键切换，跳过带锁的升级入口。不可用的标签会在附加目录和发送前返回 `model_unavailable`。省略模型时先确认 Gemini 的当前选择可用。模型列表会随账户和模式变化。查询会切换到一个新的空白输入页，且不会发送消息。
 
 任务提示中会带一个短标记供桥接核对会话。任务记录和已完成回复保存在 `~/Library/Application Support/Gemini Desktop Bridge/tasks.sqlite3`，其父目录仅本用户有访问权。Gemini Desktop 的注册目录和历史由 Gemini 自身管理。桥接依赖 Gemini 当前的辅助功能控件，中文界面已实测。Gemini 界面变化可能导致控件诊断状态，修改配置前可先运行 `gemini_health`。
 

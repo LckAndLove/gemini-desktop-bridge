@@ -486,7 +486,6 @@ final class Gemini {
         let name: String
         let available: Bool
         let selected: Bool
-        let item: AXUIElement
     }
 
     private func modelMenu() throws -> (AXUIElement, [ModelOption]) {
@@ -507,7 +506,7 @@ final class Gemini {
             guard let name = labels(item).first(where: { !$0.isEmpty }),
                   let available = attr(item, "AXEnabled") as? Bool else { return nil }
             let selected = (attr(item, "AXSelected") as? Bool) == true
-            return ModelOption(name: name, available: available, selected: selected, item: item)
+            return ModelOption(name: name, available: available, selected: selected)
         }
         guard !options.isEmpty, options.count == rows.count,
               Set(options.map(\.name)).count == options.count,
@@ -531,27 +530,54 @@ final class Gemini {
         }
     }
 
-    private func chooseModel(_ name: String) throws {
+    private func readModels() throws -> [ModelOption] {
         let (popover, options) = try modelMenu()
-        guard let option = options.first(where: { $0.name == name && $0.available }) else {
-            try closeModelMenu(popover)
-            let available = options.filter(\.available).map(\.name).joined(separator: " / ")
-            throw BridgeError("model_unavailable", "That exact model label is unavailable in this mode. Available: \(available).")
+        try closeModelMenu(popover)
+        return options
+    }
+
+    private func selectedModel(in options: [ModelOption]) throws -> String {
+        guard let model = options.first(where: { $0.selected && $0.available }) else {
+            throw BridgeError("model_unavailable", "Gemini's current model is unavailable. Select an available model in Gemini and retry.")
         }
-        if option.selected {
-            try closeModelMenu(popover)
-            return
+        return model.name
+    }
+
+    private func advanceModel() throws {
+        try activateGemini()
+        let selector = try matchingButton(["tab_stop_model_selector"])
+        let help = label(selector, "AXHelp")
+        guard help.contains("⇧⌘]") || help.contains("⌘⇧]") else {
+            throw BridgeError("model_cycle_unavailable", "Gemini did not advertise the Next Model shortcut.")
         }
-        try press(option.item)
-        _ = try waitFor("model_menu_still_open", "Gemini did not accept the model click.", seconds: 3) {
-            guard let selector = button(self.items(), ["tab_stop_model_selector"]) else { return nil as Bool? }
-            return nodes(selector).contains { label($0, "AXRole") == "AXPopover" } ? nil : true
+        let previous = label(selector, "AXDescription")
+        // Gemini's Next Model shortcut skips locked rows. Their AXEnabled flag
+        // can be true because pressing them opens the upgrade page.
+        try key(30, flags: [.maskShift, .maskCommand])
+        _ = try? waitFor("model_cycle_unchanged", "Gemini did not switch models.", seconds: 0.8) {
+            guard let current = button(self.items(), ["tab_stop_model_selector"]),
+                  label(current, "AXDescription") != previous else { return nil as Bool? }
+            return true
         }
-        let (check, observed) = try modelMenu()
-        try closeModelMenu(check)
-        guard observed.contains(where: { $0.name == name && $0.selected && $0.available }) else {
-            throw BridgeError("model_not_selected", "Gemini did not mark the requested row selected.")
+    }
+
+    private func chooseModel(_ name: String?) throws -> (selected: String, available: Set<String>) {
+        let options = try readModels()
+        let initial = try selectedModel(in: options)
+        var available: Set<String> = [initial]
+        if name == initial { return (initial, available) }
+        for _ in options {
+            try advanceModel()
+            let current = try selectedModel(in: readModels())
+            if current == initial {
+                if name == nil { return (initial, available) }
+                let models = options.filter { available.contains($0.name) }.map(\.name).joined(separator: " / ")
+                throw BridgeError("model_unavailable", "That exact model label is unavailable in this mode. Available: \(models).")
+            }
+            guard options.contains(where: { $0.name == current }), available.insert(current).inserted else { break }
+            if current == name { return (current, available) }
         }
+        throw BridgeError("model_menu_unrecognized", "Gemini's model rotation could not be verified.")
     }
 
     func usageQuota() throws -> [String: Any] {
@@ -624,13 +650,14 @@ final class Gemini {
 
     func listModels() throws -> [String: Any] {
         try prepareComposer()
-        let (popover, options) = try modelMenu()
-        try closeModelMenu(popover)
+        let selection = try chooseModel(nil)
+        let options = try readModels()
         return [
             "status": "ready",
             "mode": request.mode ?? "task",
-            "selected": options.first(where: \.selected)?.name as Any? ?? NSNull(),
-            "models": options.map { ["label": $0.name, "available": $0.available, "selected": $0.selected] }
+            "selected": selection.selected,
+            "models": options.filter { selection.available.contains($0.name) }
+                .map { ["label": $0.name, "available": true, "selected": $0.selected] }
         ]
     }
 
@@ -640,19 +667,14 @@ final class Gemini {
         }
         if let continueMarker = request.continueMarker {
             try prepareContinuation(continueMarker)
-            if let model = request.model { try chooseModel(model) }
         } else {
             try prepareComposer()
-            if let model = request.model { try chooseModel(model) }
-            if let directory = request.directory {
-                try selectFolder(directory)
-                if let model = request.model {
-                    let (popover, options) = try modelMenu()
-                    try closeModelMenu(popover)
-                    guard options.contains(where: { $0.name == model && $0.selected && $0.available }) else {
-                        throw BridgeError("model_not_selected", "Gemini changed the selected model after attaching the folder.")
-                    }
-                }
+        }
+        let model = try request.model.map { try chooseModel($0).selected } ?? selectedModel(in: readModels())
+        if request.continueMarker == nil, let directory = request.directory {
+            try selectFolder(directory)
+            guard try selectedModel(in: readModels()) == model else {
+                throw BridgeError("model_not_selected", "Gemini changed the selected model after attaching the folder.")
             }
         }
         let items = self.items()
